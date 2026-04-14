@@ -2683,11 +2683,14 @@ TSharedPtr<FJsonObject> FUnrealMCPUMGCommands::HandleAddCommonButton(const TShar
 	FString ButtonPath = FMCPCommonUIConfig::Get().GetWidgetPath(TEXT("CommonButton"));
 	if (ButtonPath.IsEmpty())
 	{
-		return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("CommonButton path not configured"));
+		return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT(
+			"CommonButton template path is not configured. "
+			"Either call set_common_ui_config(type_name=\"CommonButton\", blueprint_path=\"/Game/UI/YourButtonTemplate\") first, "
+			"or use add_common_button_base which instantiates the engine CommonButtonBase class directly with no template needed."));
 	}
-	
+
 	NewParams->SetStringField(TEXT("blueprint_path"), ButtonPath);
-	
+
 	return HandleAddWidgetBlueprintInstance(NewParams);
 }
 

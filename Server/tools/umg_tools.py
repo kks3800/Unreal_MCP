@@ -1266,7 +1266,7 @@ def register_widget_batch_tools(mcp: FastMCP):
             if not unreal:
                 return {"success": False, "message": "Failed to connect"}
             response = unreal.send_command("begin_widget_edit", {
-                "blueprint_name": widget_name
+                "widget_name": widget_name
             })
             return response if response else {"success": False, "message": "No response"}
         except Exception as e:
@@ -1291,7 +1291,7 @@ def register_widget_batch_tools(mcp: FastMCP):
             if not unreal:
                 return {"success": False, "message": "Failed to connect"}
             response = unreal.send_command("end_widget_edit", {
-                "blueprint_name": widget_name
+                "widget_name": widget_name
             })
             return response if response else {"success": False, "message": "No response"}
         except Exception as e:

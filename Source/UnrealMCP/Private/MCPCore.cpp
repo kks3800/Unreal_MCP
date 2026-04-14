@@ -507,10 +507,13 @@ TArray<FString> FMCPCommonUIConfig::GetConfiguredTypes() const
 
 void FMCPCommonUIConfig::InitializeDefaults()
 {
-	// Default Common UI paths (customize for your project)
-	WidgetPaths.Add(TEXT("CommonButton"), TEXT("/Game/Blueprints/CommonUI/WBP_CommonButton"));
-	WidgetPaths.Add(TEXT("CommonText"), TEXT("/Game/Blueprints/CommonUI/WBP_CommonText"));
-	WidgetPaths.Add(TEXT("CommonActivatable"), TEXT("/Game/Blueprints/CommonUI/WBP_CommonActivatable"));
+	// Intentionally empty. Common UI widget template paths are project-specific
+	// — there is no universally-correct default. Users configure per-project via
+	// set_common_ui_config(type_name, blueprint_path) before calling the
+	// template-backed tools like add_common_button / add_common_text.
+	// Tools that don't require a user-supplied template (e.g. add_common_button_base
+	// which instantiates the engine UCommonButtonBase class directly) work without
+	// any configuration.
 }
 
 // ============================================================================
