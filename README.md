@@ -8,7 +8,7 @@
 [![MCP](https://img.shields.io/badge/Model%20Context%20Protocol-compatible-purple.svg)](https://modelcontextprotocol.io/)
 [![Status: WIP](https://img.shields.io/badge/status-heavy%20WIP-orange.svg)](#project-status)
 
-UnrealMCP lets AI assistants like **Claude Code**, **Claude Desktop**, **Cursor**, and **Windsurf** directly drive the Unreal Engine Editor. Spawn actors, build blueprints, author materials, compose UMG widgets, design MetaSounds, wire behavior trees, and more -- all from a prompt.
+UnrealMCP lets AI assistants like **Claude Code**, **Claude Desktop**, **Cursor**, and **Windsurf** directly drive the Unreal Engine Editor. Spawn actors, build blueprints, author materials, compose UMG widgets, wire behavior trees, and more -- all from a prompt.
 
 > **449 tools across 21 domains.** Full editor automation, not just a toy demo.
 
@@ -67,12 +67,10 @@ Ask an AI assistant to:
 - **"Spawn a grid of 10x10 cubes with random colors."**
 - **"Create a lobby HUD with player avatars, names, ready states, and a start button."**
 - **"Make a translucent UI material with a radial gradient and soft glow."**
-- **"Add a MetaSound with an oscillator, low-pass filter, and ADSR envelope."**
 - **"Design a behavior tree for an AI that patrols, detects the player, then chases."**
 - **"Generate an EQS query that finds cover positions away from the player."**
 - **"Procedurally build a spiral staircase with 30 steps."**
 - **"Analyze my blueprint graph for complexity hotspots."**
-- **"Write a PCG graph that scatters meshes on a landscape with density rules."**
 
 ...and it will happen inside your running Unreal Editor.
 
@@ -404,7 +402,10 @@ The biggest surface area. Full UMG + Common UI support:
 
 Plus the **material graph builder** -- takes a JSON tree description and constructs a full material graph.
 
-### MetaSounds (26 tools)
+### MetaSounds (26 tools) -- EXPERIMENTAL
+
+> [!WARNING]
+> **Basic MetaSound authoring works but coverage is thin.** Simple graphs (source + a few nodes) generally succeed; anything involving exotic node types, MetaSound sub-patches, or presets is unverified and often breaks. Use for quick prototypes only, not production audio work.
 
 - Create MetaSound sources and presets
 - Add nodes by class path (oscillators, filters, envelopes, math, conversions, audio I/O)
@@ -437,7 +438,10 @@ Create and manage blackboards, add/remove/modify keys, get/set/clear values at r
 
 Full EQS authoring: create queries, add generators, add tests (Distance, Dot, Trace, Overlap, Project, custom project subclasses), set generator/test properties via reflection (supports enum arrays, structs, soft references). Open queries in the editor. Discover available options dynamically.
 
-### PCG (25 tools) -- Procedural Content Generation
+### PCG (25 tools) -- EXPERIMENTAL
+
+> [!WARNING]
+> **Very experimental.** The tool surface exists (create/delete graphs, add/connect/move nodes, set properties via a reflection-driven marshaler) but real PCG workflows require subtle understanding of pin compatibility, data layers, and graph semantics that the AI gets wrong often. Expect frequent failures on anything beyond trivial graphs.
 
 Reflection-driven PCG graph authoring:
 
@@ -617,7 +621,7 @@ This project has been **substantially rewritten and expanded** since, adding:
 - 449 MCP tools (from the original small set)
 - Session-based editing for deterministic multi-step operations
 - Blueprint graph builder, material graph builder, and blueprint intelligence tooling
-- PCG, MetaSounds, Behavior Trees, Blackboards, EQS, and Input support (Niagara is scaffolded but not yet functional)
+- Behavior Trees, Blackboards, EQS, and Input support (PCG and MetaSounds are experimental; Niagara is scaffolded but not functional)
 - A generic property marshaler handling structs, arrays, maps, sets, enums, object/class/soft-references, and `FMapProperty`
 - 100+ UMG / Common UI widget types
 - Full blueprint inspection and search

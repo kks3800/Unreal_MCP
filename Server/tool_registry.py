@@ -300,13 +300,16 @@ def register_meta_tools(mcp: FastMCP, registry: ToolRegistry) -> None:
           tree/tile views, styling, animations, event binding
         - material (~30): PBR materials, material graph nodes, instance
           parameters, material functions
-        - metasound (~25): oscillators, filters, envelopes, audio routing
+        - metasound (~25): EXPERIMENTAL — oscillators, filters, envelopes,
+          audio routing. Simple graphs work; complex cases often break.
         - niagara (~35): NOT WORKING YET — scaffolded only, do not rely on
         - behavior_tree (~50): BT composites, decorators, services, tasks,
           runtime control
         - blackboard (8): BB keys and values, runtime state
         - eqs (~15): environment queries, generators, tests
-        - pcg (~25): procedural content generation nodes, property marshaler
+        - pcg (~25): EXPERIMENTAL — procedural content generation nodes,
+          property marshaler. Trivial graphs only; AI gets pin semantics
+          and data-layer rules wrong often.
         - asset (~15): bulk rename/move, redirectors, folder analysis,
           references
         - input (~10): Enhanced Input mappings, action/axis bindings
