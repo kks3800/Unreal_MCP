@@ -27,3 +27,6 @@ DerivedDataCache/
 # OS
 Thumbs.db
 .DS_Store
+
+# Internal design docs (kept local only)
+Docs/

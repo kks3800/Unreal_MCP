@@ -377,14 +377,80 @@ else:
                 _enabled_modules -= _overlap
                 logger.info(f"Removed sub-modules {sorted(_overlap)} — parent '{_parent}' covers them")
 
-for _mod_name, _register_fn in MODULE_REGISTRY.items():
-    if _mod_name in _enabled_modules:
-        _register_fn(mcp)
-        logger.info(f"Registered module: {_mod_name}")
-    else:
-        logger.info(f"Skipped module: {_mod_name}")
+# ---------------------------------------------------------------------------
+# DYNAMIC_MODE — opt-in dynamic toolset registration
+# ---------------------------------------------------------------------------
+# When set (DYNAMIC_MODE=1 in .mcp.json env), each module is registered
+# through a RecordingProxy that captures tools into a ToolRegistry instead
+# of exposing them to the MCP client. Only the ~20 core tools + 3 meta-tools
+# (search/describe/execute) are exposed; the rest are reached dynamically.
+# Rationale and design: see Docs/DYNAMIC_TOOLSETS_PLAN.md.
+# Falls back automatically to legacy all-tools mode if setup fails.
 
-logger.info(f"Modules loaded: {len(_enabled_modules)}/{len(MODULE_REGISTRY)}")
+_dynamic_mode_enabled = os.environ.get("DYNAMIC_MODE", "0") == "1"
+
+if _dynamic_mode_enabled:
+    try:
+        from tool_registry import ToolRegistry, RecordingProxy, register_meta_tools
+        from tool_categories import MODULE_CATEGORIES, CORE_TOOLS, KEYWORD_OVERRIDES
+
+        _registry = ToolRegistry()
+        _capture_failures: list[str] = []
+
+        for _mod_name, _register_fn in MODULE_REGISTRY.items():
+            if _mod_name not in _enabled_modules:
+                logger.info(f"Skipped module: {_mod_name}")
+                continue
+            _category = MODULE_CATEGORIES.get(_mod_name, "misc")
+            _proxy = RecordingProxy(
+                registry=_registry,
+                category=_category,
+                core_names=CORE_TOOLS,
+                keyword_overrides=KEYWORD_OVERRIDES,
+            )
+            try:
+                _register_fn(_proxy)
+                logger.info(f"Captured module: {_mod_name}")
+            except Exception as e:
+                _capture_failures.append(_mod_name)
+                logger.warning(f"DYNAMIC_MODE: failed to capture module {_mod_name}: {e}")
+
+        if len(_registry) == 0:
+            raise RuntimeError("registry is empty after capture")
+
+        # Expose only the core tools to the real mcp
+        _core_count = 0
+        for _name, _meta in _registry._tools.items():
+            if _meta.is_core:
+                # Use FastMCP's registration with the captured callable
+                mcp.tool(name=_name, description=_meta.description)(_meta.func)
+                _core_count += 1
+
+        register_meta_tools(mcp, _registry)
+
+        _dyn_count = len(_registry) - _core_count
+        logger.info(
+            f"DYNAMIC_MODE enabled: {_core_count} core + 3 meta + {_dyn_count} dynamic "
+            f"(captured from {len(_enabled_modules) - len(_capture_failures)}/"
+            f"{len(_enabled_modules)} modules)"
+        )
+        if _capture_failures:
+            logger.warning(f"DYNAMIC_MODE: these modules failed to capture: {_capture_failures}")
+
+    except Exception as e:
+        logger.error(f"DYNAMIC_MODE setup failed, falling back to legacy all-tools mode: {e}")
+        _dynamic_mode_enabled = False
+
+if not _dynamic_mode_enabled:
+    # Legacy path — register every enabled module directly on the real mcp
+    for _mod_name, _register_fn in MODULE_REGISTRY.items():
+        if _mod_name in _enabled_modules:
+            _register_fn(mcp)
+            logger.info(f"Registered module: {_mod_name}")
+        else:
+            logger.info(f"Skipped module: {_mod_name}")
+
+    logger.info(f"Modules loaded: {len(_enabled_modules)}/{len(MODULE_REGISTRY)}")
 
 @mcp.prompt()
 def info():

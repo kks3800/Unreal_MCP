@@ -10,7 +10,7 @@
 
 UnrealMCP lets AI assistants like **Claude Code**, **Claude Desktop**, **Cursor**, and **Windsurf** directly drive the Unreal Engine Editor. Spawn actors, build blueprints, author materials, compose UMG widgets, design MetaSounds, wire behavior trees, and more -- all from a prompt.
 
-> **463 tools across 21 domains.** Full editor automation, not just a toy demo.
+> **449 tools across 21 domains.** Full editor automation, not just a toy demo.
 
 ---
 
@@ -34,6 +34,7 @@ UnrealMCP lets AI assistants like **Claude Code**, **Claude Desktop**, **Cursor*
 - [Quick Install (AI-Assisted)](#quick-install-ai-assisted)
 - [Manual Install](#manual-install)
 - [Your First Prompt](#your-first-prompt)
+- [Reducing Context Cost](#reducing-context-cost)
 - [Feature Reference](#feature-reference)
 - [Repository Layout](#repository-layout)
 - [Security Model](#security-model)
@@ -72,7 +73,7 @@ Ask an AI assistant to:
              | MCP protocol (stdio)
              v
  +--------------------------+
- |  Python FastMCP Server   |   463 @mcp.tool() wrappers
+ |  Python FastMCP Server   |   449 @mcp.tool() wrappers
  |  Server/                 |
  +-----------+--------------+
              | TCP JSON (127.0.0.1:55557)
@@ -91,7 +92,7 @@ Ask an AI assistant to:
 **Two moving parts:**
 
 1. **C++ Editor Plugin** (`Source/`, `UnrealMCP.uplugin`) -- an Unreal editor plugin that listens on TCP port `55557` and executes commands inside the running editor using reflection, session-based editing, and deterministic multi-step operations.
-2. **Python FastMCP Server** (`Server/`) -- a FastMCP server exposing 463 MCP tools to AI assistants and translating them into TCP commands for the plugin.
+2. **Python FastMCP Server** (`Server/`) -- a FastMCP server exposing 449 MCP tools to AI assistants and translating them into TCP commands for the plugin.
 
 Both ship in the same repo -- the entire repository is the UE plugin folder.
 
@@ -197,6 +198,8 @@ Create `.mcp.json` at your **UE project root** (the folder containing `.uproject
 
 Use **absolute paths with forward slashes** (even on Windows). Replace `<UE_PROJECT>` with your actual project root.
 
+The `env` block is where you set optional flags — see [Reducing Context Cost](#reducing-context-cost) below for `DYNAMIC_MODE` and `ENABLED_MODULES`. For a first run, the empty `{}` is fine.
+
 > For **Claude Desktop**, merge the `unreal-mcp` entry into your `claude_desktop_config.json`.
 > For **Cursor / Windsurf**, follow their MCP config docs.
 
@@ -230,9 +233,91 @@ If all three work, you're ready.
 
 ---
 
+## Reducing Context Cost
+
+UnrealMCP exposes **449 tools costing ~95k tokens** when loaded in full. On 200k-context Claude models that's tight-but-workable; on 128k-context models (GPT-4, many Cursor variants) it doesn't fit.
+
+Two independent knobs, both set in `.mcp.json` under the server's `env` block:
+
+| Knob | What it does | When to use |
+|------|--------------|-------------|
+| `DYNAMIC_MODE=1` | Exposes only 22 tools (19 core + 3 meta-tools `search_unreal_tools` / `describe_unreal_tools` / `execute_unreal_tool`). Drops upfront cost from ~95k → ~3k tokens (**~97% reduction**). AI discovers non-core tools on demand. | Any client that isn't Claude Code. Highly recommended. |
+| `ENABLED_MODULES=...` | Loads only selected tool modules. Reduces everything (including what's reachable via search in dynamic mode). | When you know you only need certain domains. |
+
+Use one, the other, or both. They compose cleanly.
+
+### Option A — Dynamic mode (recommended)
+
+```json
+{
+  "mcpServers": {
+    "unreal-mcp": {
+      "command": "...",
+      "args": ["..."],
+      "env": {
+        "DYNAMIC_MODE": "1"
+      }
+    }
+  }
+}
+```
+
+Only 22 tools visible to the AI client: 19 always-on core tools (spawn, delete, compile, CVars, etc.) plus 3 meta-tools that search/describe/execute the other 430. The AI reads the `search_unreal_tools` docstring to learn what domains exist, searches for what it needs, then invokes via `execute_unreal_tool`.
+
+Per-task cost: ~1-2k tokens of accumulated search/describe responses. Break-even vs legacy mode at ~60 novel tool calls per session — well beyond typical usage.
+
+### Option B — Module presets
+
+```json
+{
+  "mcpServers": {
+    "unreal-mcp": {
+      "command": "...",
+      "args": ["..."],
+      "env": {
+        "ENABLED_MODULES": "editor,blueprint,material"
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "mcpServers": {
+    "unreal-mcp": {
+      "command": "...",
+      "args": ["..."],
+      "env": {
+        "ENABLED_MODULES": "editor,blueprint,material"
+      }
+    }
+  }
+}
+```
+
+### Preset recipes
+
+| Role | `ENABLED_MODULES` | ~Tools | ~Tokens |
+|------|-------------------|--------|---------|
+| **Minimal** — actors + blueprints only | `editor,blueprint,blueprint_nodes` | ~30 | ~15k |
+| **Level designer** — widgets + materials | `editor,blueprint,blueprint_nodes,widget_core,widget_commonui,material` | ~200 | ~42k |
+| **AI / gameplay programmer** — BT + blackboard + EQS | `editor,blueprint,behavior_tree,blackboard,eqs` | ~120 | ~25k |
+| **Material / shader work** | `editor,material,material_graph` | ~35 | ~8k |
+| **Audio / MetaSound** | `editor,metasound` | ~40 | ~9k |
+| **Full** — everything | `all` (or omit the var) | 449 | ~95k |
+
+### Available module names
+
+`editor`, `blueprint`, `blueprint_nodes`, `blueprint_inspect`, `blueprint_search`, `blueprint_graph`, `blueprint_compound`, `blueprint_intelligence`, `widget` (or individual sub-modules: `widget_core`, `widget_commonui`, `widget_batch`, `widget_discovery`, `widget_style`, `widget_input`, `widget_animation`, `widget_commonui_ext`, `widget_readonly`), `material`, `material_graph`, `metasound`, `niagara` (scaffolded, not functional), `asset`, `behavior_tree`, `blackboard`, `eqs`, `pcg`, `input`, `procedural`, `project`.
+
+After changing `ENABLED_MODULES` or `DYNAMIC_MODE`, **fully quit and restart your MCP client** so it re-reads the config and fetches the new tool catalog. Just reconnecting (e.g. Claude Code's `/mcp`) is often not enough — most clients cache tool schemas per session.
+
+---
+
 ## Feature Reference
 
-**463 MCP tools across 21 domains.** Every tool maps to a typed Python wrapper in `Server/tools/` and a C++ handler in `Source/UnrealMCP/Private/Commands/`.
+**449 MCP tools across 21 domains.** Every tool maps to a typed Python wrapper in `Server/tools/` and a C++ handler in `Source/UnrealMCP/Private/Commands/`.
 
 ### Editor & Scene (15 tools)
 
@@ -362,7 +447,7 @@ UnrealMCP/                        # repo root IS the UE plugin folder
 |-- Server/
 |   |-- pyproject.toml            # uv-managed Python project
 |   |-- unreal_mcp_server.py      # FastMCP entry point
-|   |-- tools/                    # 21 tool modules (~20k lines, 463 tools)
+|   |-- tools/                    # 21 tool modules (~20k lines, 449 tools)
 |   +-- scripts/                  # standalone test scripts (no MCP required)
 |-- Claude/
 |   |-- .mcp.json.template        # MCP config template
@@ -442,7 +527,7 @@ Originally inspired by [chongdashu/unreal-mcp](https://github.com/chongdashu/unr
 This project has been **substantially rewritten and expanded** since, adding:
 
 - A new command-group architecture with 21 reflection-driven C++ command modules
-- 463 MCP tools (from the original small set)
+- 449 MCP tools (from the original small set)
 - Session-based editing for deterministic multi-step operations
 - Blueprint graph builder, material graph builder, and blueprint intelligence tooling
 - PCG, MetaSounds, Behavior Trees, Blackboards, EQS, and Input support (Niagara is scaffolded but not yet functional)

@@ -6,7 +6,10 @@
       "args": [
         "<YOUR_PROJECT_PATH>/Plugins/UnrealMCP/Server/unreal_mcp_server.py"
       ],
-      "env": {}
+      "env": {
+        "ENABLED_MODULES": "all",
+        "DYNAMIC_MODE": "0"
+      }
     }
   }
 }
