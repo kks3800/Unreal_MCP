@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "unreal-mcp": {
+      "type": "stdio",
+      "command": "<YOUR_PROJECT_PATH>/Plugins/UnrealMCP/Server/.venv/Scripts/python.exe",
+      "args": [
+        "<YOUR_PROJECT_PATH>/Plugins/UnrealMCP/Server/unreal_mcp_server.py"
+      ],
+      "env": {}
+    }
+  }
+}

@@ -1,0 +1,29 @@
+# Python
+.venv/
+__pycache__/
+*.egg-info/
+*.pyc
+*.pyo
+
+# UE Build Artifacts
+Binaries/
+Intermediate/
+DerivedDataCache/
+*.dll
+*.pdb
+*.lib
+*.exp
+
+# Logs
+*.log
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.sln
+*.suo
+
+# OS
+Thumbs.db
+.DS_Store
