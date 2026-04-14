@@ -78,8 +78,8 @@ private:
 	/** Extract the protected_paths JSON array into a TArray. */
 	TArray<FString> GetProtectedPaths(const TSharedPtr<FJsonObject>& Params) const;
 
-	/** Build a recursive folder tree as nested JSON. */
-	TSharedPtr<FJsonObject> BuildFolderTree(const FString& DirectoryPath, int32 CurrentDepth, int32 MaxDepth, bool bIncludeAssetCounts) const;
+	/** Build a recursive folder tree as nested JSON. Cycle-safe via VisitedPaths; hard-capped at MAX_SAFE_FOLDER_DEPTH. */
+	TSharedPtr<FJsonObject> BuildFolderTree(const FString& DirectoryPath, int32 CurrentDepth, int32 MaxDepth, bool bIncludeAssetCounts, TSet<FString>& VisitedPaths) const;
 
 	/** Check if an asset name follows the expected prefix convention. */
 	bool CheckNamingConvention(const FString& AssetName, const FString& ClassName, FString& OutExpectedPrefix) const;

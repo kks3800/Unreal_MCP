@@ -140,65 +140,81 @@ TArray<FString> FUnrealMCPAssetCommands::GetProtectedPaths(
 	return Result;
 }
 
+/** Hard stack-safety cap on folder recursion depth regardless of caller-supplied MaxDepth. */
+static constexpr int32 MAX_SAFE_FOLDER_DEPTH = 32;
+
 TSharedPtr<FJsonObject> FUnrealMCPAssetCommands::BuildFolderTree(
 	const FString& DirectoryPath,
 	int32 CurrentDepth,
 	int32 MaxDepth,
-	bool bIncludeAssetCounts) const
+	bool bIncludeAssetCounts,
+	TSet<FString>& VisitedPaths) const
 {
 	TSharedPtr<FJsonObject> Node = MakeShareable(new FJsonObject);
 
-	// Extract folder name from path
-	FString FolderName = FPaths::GetCleanFilename(DirectoryPath);
+	// Normalise path (strip trailing slash) for consistent cycle detection.
+	FString NormalisedPath = DirectoryPath;
+	NormalisedPath.RemoveFromEnd(TEXT("/"));
+
+	FString FolderName = FPaths::GetCleanFilename(NormalisedPath);
 	if (FolderName.IsEmpty())
 	{
-		FolderName = DirectoryPath;
+		FolderName = NormalisedPath;
 	}
 
 	Node->SetStringField(TEXT("name"), FolderName);
-	Node->SetStringField(TEXT("path"), DirectoryPath);
+	Node->SetStringField(TEXT("path"), NormalisedPath);
+
+	// Cycle guard: if we've already visited this path, return a stub node and do not recurse.
+	if (VisitedPaths.Contains(NormalisedPath))
+	{
+		Node->SetBoolField(TEXT("cycle"), true);
+		Node->SetArrayField(TEXT("children"), TArray<TSharedPtr<FJsonValue>>());
+		return Node;
+	}
+	VisitedPaths.Add(NormalisedPath);
 
 	if (bIncludeAssetCounts)
 	{
-		// Count assets directly in this folder (non-recursive)
-		TArray<FString> Assets = UEditorAssetLibrary::ListAssets(DirectoryPath, false, false);
+		TArray<FString> Assets = UEditorAssetLibrary::ListAssets(NormalisedPath, false, false);
 		Node->SetNumberField(TEXT("asset_count"), Assets.Num());
 	}
 
-	// Build children if within depth limit
+	// Build children only if within both the caller-supplied depth limit AND the hard stack-safety cap.
 	TArray<TSharedPtr<FJsonValue>> Children;
-	if (MaxDepth < 0 || CurrentDepth < MaxDepth)
+	const bool bWithinCallerDepth = (MaxDepth < 0) || (CurrentDepth < MaxDepth);
+	const bool bWithinSafetyCap   = CurrentDepth < MAX_SAFE_FOLDER_DEPTH;
+	if (bWithinCallerDepth && bWithinSafetyCap)
 	{
-		// List assets including folders to discover subfolders
-		TArray<FString> AllItems = UEditorAssetLibrary::ListAssets(DirectoryPath, false, true);
+		// Use the asset registry's GetSubPaths as the canonical source of immediate subfolders.
 		TSet<FString> SubDirs;
-
-		for (const FString& Item : AllItems)
-		{
-			if (UEditorAssetLibrary::DoesDirectoryExist(Item))
-			{
-				SubDirs.Add(Item);
-			}
-		}
-
-		// Also use the asset registry to find sub-paths
 		IAssetRegistry* Registry = IAssetRegistry::Get();
 		if (Registry)
 		{
 			TArray<FString> SubPaths;
-			Registry->GetSubPaths(DirectoryPath, SubPaths, false);
+			Registry->GetSubPaths(NormalisedPath, SubPaths, /*bRecurse=*/false);
 			for (const FString& SubPath : SubPaths)
 			{
-				SubDirs.Add(SubPath);
+				FString NormSub = SubPath;
+				NormSub.RemoveFromEnd(TEXT("/"));
+				// Skip self-references — prevents a class of infinite-recursion bugs.
+				if (NormSub != NormalisedPath && !NormSub.IsEmpty())
+				{
+					SubDirs.Add(NormSub);
+				}
 			}
 		}
 
 		for (const FString& SubDir : SubDirs)
 		{
 			TSharedPtr<FJsonObject> ChildNode = BuildFolderTree(
-				SubDir, CurrentDepth + 1, MaxDepth, bIncludeAssetCounts);
+				SubDir, CurrentDepth + 1, MaxDepth, bIncludeAssetCounts, VisitedPaths);
 			Children.Add(MakeShareable(new FJsonValueObject(ChildNode)));
 		}
+	}
+	else if (!bWithinSafetyCap)
+	{
+		Node->SetBoolField(TEXT("truncated_at_safety_cap"), true);
 	}
 
 	Node->SetArrayField(TEXT("children"), Children);
@@ -472,7 +488,9 @@ TSharedPtr<FJsonObject> FUnrealMCPAssetCommands::HandleGetFolderStructure(
 		DirectoryPath = TEXT("/Game");
 	}
 
-	int32 MaxDepth = -1; // unlimited by default
+	// Default depth was previously -1 (unlimited) which could stack-overflow on pathological content.
+	// Use 8 as a sensible default; callers wanting deeper trees can pass max_depth explicitly.
+	int32 MaxDepth = 8;
 	if (Params->HasField(TEXT("max_depth")))
 	{
 		MaxDepth = static_cast<int32>(Params->GetNumberField(TEXT("max_depth")));
@@ -484,7 +502,8 @@ TSharedPtr<FJsonObject> FUnrealMCPAssetCommands::HandleGetFolderStructure(
 		bIncludeAssetCounts = Params->GetBoolField(TEXT("include_asset_counts"));
 	}
 
-	TSharedPtr<FJsonObject> Tree = BuildFolderTree(DirectoryPath, 0, MaxDepth, bIncludeAssetCounts);
+	TSet<FString> VisitedPaths;
+	TSharedPtr<FJsonObject> Tree = BuildFolderTree(DirectoryPath, 0, MaxDepth, bIncludeAssetCounts, VisitedPaths);
 
 	TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject);
 	Result->SetBoolField(TEXT("success"), true);
