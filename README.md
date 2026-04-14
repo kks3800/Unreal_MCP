@@ -3,18 +3,31 @@
 **Control Unreal Engine with natural language through any MCP-compatible AI assistant.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Unreal Engine 5.5+](https://img.shields.io/badge/Unreal%20Engine-5.5%2B-blue.svg)](https://www.unrealengine.com/)
+[![Unreal Engine 5.7](https://img.shields.io/badge/Unreal%20Engine-5.7-blue.svg)](https://www.unrealengine.com/)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/Model%20Context%20Protocol-compatible-purple.svg)](https://modelcontextprotocol.io/)
+[![Status: WIP](https://img.shields.io/badge/status-heavy%20WIP-orange.svg)](#project-status)
 
-UnrealMCP lets AI assistants like **Claude Code**, **Claude Desktop**, **Cursor**, and **Windsurf** directly drive the Unreal Engine Editor. Spawn actors, build blueprints, author materials, compose UMG widgets, design MetaSounds, craft Niagara effects, wire behavior trees, and more -- all from a prompt.
+UnrealMCP lets AI assistants like **Claude Code**, **Claude Desktop**, **Cursor**, and **Windsurf** directly drive the Unreal Engine Editor. Spawn actors, build blueprints, author materials, compose UMG widgets, design MetaSounds, wire behavior trees, and more -- all from a prompt.
 
 > **463 tools across 21 domains.** Full editor automation, not just a toy demo.
 
 ---
 
+## Project Status
+
+> [!WARNING]
+> **This is heavy work-in-progress.** Things will break, some tools are incomplete, some are slow, and some subsystems (notably **Niagara**) are not functional yet. Expect rough edges and use at your own risk. Issues and PRs welcome.
+>
+> **Built with AI.** A large portion of this codebase was written with AI assistance -- primarily **Claude** (Anthropic). Code quality varies accordingly: some parts are polished, others need a human pass. Every tool is exercised in real Unreal projects before shipping, but coverage is uneven.
+>
+> **Unreal Engine 5.7 only.** That's what it's developed and tested against. It may work on older 5.x versions, but this is unverified -- if you try it on 5.5 / 5.6, expect to fix things yourself.
+
+---
+
 ## Table of Contents
 
+- [Project Status](#project-status)
 - [What It Can Do](#what-it-can-do)
 - [How It Works](#how-it-works)
 - [Requirements](#requirements)
@@ -37,7 +50,6 @@ Ask an AI assistant to:
 
 - **"Spawn a grid of 10x10 cubes with random colors."**
 - **"Create a lobby HUD with player avatars, names, ready states, and a start button."**
-- **"Build a Niagara spark effect with mesh sparks and a ribbon trail."**
 - **"Make a translucent UI material with a radial gradient and soft glow."**
 - **"Add a MetaSound with an oscillator, low-pass filter, and ADSR envelope."**
 - **"Design a behavior tree for an AI that patrols, detects the player, then chases."**
@@ -89,7 +101,7 @@ Both ship in the same repo -- the entire repository is the UE plugin folder.
 
 | Requirement | Version | Notes |
 |-------------|---------|-------|
-| Unreal Engine | **5.5+** | Tested on 5.5 and 5.7 |
+| Unreal Engine | **5.7** | Only 5.7 is tested. Older 5.x versions may work but are unsupported. |
 | Python | **3.10+** | For the FastMCP server |
 | `uv` package manager | latest | `pip install uv` or see [astral.sh/uv](https://astral.sh/uv) |
 | Build toolchain | MSVC / Xcode / Clang | Required to compile the C++ plugin |
@@ -275,14 +287,10 @@ Plus the **material graph builder** -- takes a JSON tree description and constru
 - Set default values on inputs and node pins
 - Auto-build metasound graphs from a description
 
-### Niagara (38 tools)
+### Niagara (38 tools) -- NOT WORKING YET
 
-- Create Niagara systems
-- Add emitters, configure modes (CPU/GPU, burst/continuous)
-- Five renderer types: sprite, mesh, ribbon, light, plus assign materials per renderer
-- Module parameters, user parameters, expose/hide them on the system
-- Emitter enable/disable/isolate/duplicate/rename
-- System-level property editing and compile
+> [!CAUTION]
+> **Niagara support is scaffolded but not functional.** The tool surface exists (create systems, add emitters/renderers/modules, configure CPU/GPU modes, parameter exposure, emitter control, etc.) but the underlying C++ commands do not produce working VFX in the current state. **Do not rely on these tools.** Fixing this is on the roadmap -- PRs welcome.
 
 ### Behavior Trees (51 tools)
 
@@ -437,10 +445,14 @@ This project has been **substantially rewritten and expanded** since, adding:
 - 463 MCP tools (from the original small set)
 - Session-based editing for deterministic multi-step operations
 - Blueprint graph builder, material graph builder, and blueprint intelligence tooling
-- PCG, MetaSounds, Niagara (full renderer support), Behavior Trees, Blackboards, EQS, and Input support
+- PCG, MetaSounds, Behavior Trees, Blackboards, EQS, and Input support (Niagara is scaffolded but not yet functional)
 - A generic property marshaler handling structs, arrays, maps, sets, enums, object/class/soft-references, and `FMapProperty`
 - 100+ UMG / Common UI widget types
 - Full blueprint inspection and search
+
+### Built With AI
+
+A large portion of this codebase was written with AI assistance -- primarily **Claude (Anthropic)** via Claude Code. Reviewing, testing, and direction come from a human; a lot of the mechanical C++ / Python was AI-generated. This means quality is uneven, and some areas need human cleanup. If you spot rough code, a PR is the fastest way to fix it.
 
 ---
 
