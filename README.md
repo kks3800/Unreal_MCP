@@ -19,9 +19,23 @@ UnrealMCP lets AI assistants like **Claude Code**, **Claude Desktop**, **Cursor*
 > [!WARNING]
 > **This is heavy work-in-progress.** Things will break, some tools are incomplete, some are slow, and some subsystems (notably **Niagara**) are not functional yet. Expect rough edges and use at your own risk. Issues and PRs welcome.
 >
-> **Built with AI.** A large portion of this codebase was written with AI assistance -- primarily **Claude** (Anthropic). Code quality varies accordingly: some parts are polished, others need a human pass. Every tool is exercised in real Unreal projects before shipping, but coverage is uneven.
+> **Built with AI.** A large portion of this codebase was written with AI assistance -- primarily **Claude** (Anthropic). Code quality varies accordingly: some parts are polished, others need a human pass. Testing coverage is uneven and ad-hoc -- please report anything broken.
 >
 > **Unreal Engine 5.7 only.** That's what it's developed and tested against. It may work on older 5.x versions, but this is unverified -- if you try it on 5.5 / 5.6, expect to fix things yourself.
+
+### Verified client compatibility
+
+| Client | Status | Notes |
+|--------|--------|-------|
+| Claude Code (Sonnet/Opus) | ✅ Verified — daily driver | Built and tested here |
+| Claude Desktop | 🟡 Expected to work | MCP-standard, not extensively tested |
+| Cursor | 🟡 Expected to work | MCP-standard |
+| Codex CLI (OpenAI) | 🟡 Expected to work | MCP-standard; use `DYNAMIC_MODE=1` for 128k context |
+| Windsurf | 🟡 Expected to work | MCP-standard |
+| Cline (VS Code) | 🟡 Expected to work | MCP-standard |
+| Continue.dev | 🟡 Expected to work | MCP-standard |
+
+If you use a client that isn't on this list or runs into issues, please file an issue with the client name and behaviour observed.
 
 ---
 
@@ -38,6 +52,7 @@ UnrealMCP lets AI assistants like **Claude Code**, **Claude Desktop**, **Cursor*
 - [Feature Reference](#feature-reference)
 - [Repository Layout](#repository-layout)
 - [Security Model](#security-model)
+- [FAQ](#faq)
 - [Troubleshooting](#troubleshooting)
 - [Contributing](#contributing)
 - [Credits](#credits)
@@ -200,8 +215,21 @@ Use **absolute paths with forward slashes** (even on Windows). Replace `<UE_PROJ
 
 The `env` block is where you set optional flags — see [Reducing Context Cost](#reducing-context-cost) below for `DYNAMIC_MODE` and `ENABLED_MODULES`. For a first run, the empty `{}` is fine.
 
-> For **Claude Desktop**, merge the `unreal-mcp` entry into your `claude_desktop_config.json`.
-> For **Cursor / Windsurf**, follow their MCP config docs.
+#### Per-client config locations
+
+The MCP config shape above is the same for every client — only the file location and wrapper key change. Add an `unreal-mcp` entry inside `mcpServers`:
+
+| Client | Config file | Notes |
+|--------|-------------|-------|
+| **Claude Code** | `<UE_PROJECT>/.mcp.json` | Project-scoped. Restart Claude Code after editing. |
+| **Claude Desktop** | `%APPDATA%\Claude\claude_desktop_config.json` (Windows)<br>`~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) | Global. Fully quit + relaunch the app to reload. |
+| **Cursor** | `~/.cursor/mcp.json` (global) or `<UE_PROJECT>/.cursor/mcp.json` (project) | See Cursor's MCP docs. |
+| **Windsurf** | `~/.codeium/windsurf/mcp_config.json` | See Windsurf's MCP docs. |
+| **Codex CLI** (OpenAI) | `~/.codex/config.json` under `mcp_servers` | See OpenAI's Codex CLI docs. |
+| **Cline** (VS Code) | VS Code settings → `cline.mcpServers` | JSON same shape, nested in settings. |
+| **Continue.dev** | `~/.continue/config.json` | See Continue docs. |
+
+Any MCP-compatible client works — the plugin is client-agnostic.
 
 ### Step 4 -- (Optional) Install the Claude Code widget agent
 
@@ -218,6 +246,19 @@ cp <UE_PROJECT>/Plugins/UnrealMCP/Claude/agents/mcp-widget-expert.md \
 1. Open your Unreal project in the editor. The plugin starts its TCP server automatically.
 2. Restart your MCP client (so it reads the new `.mcp.json`).
 3. Ask the AI to do something (see [Your First Prompt](#your-first-prompt)).
+
+### Updating the plugin later
+
+```bash
+cd <UE_PROJECT>/Plugins/UnrealMCP
+git pull
+
+# If any Python dependencies changed:
+cd Server
+uv pip install -e .
+```
+
+If the update includes C++ changes (anything in `Source/`), **rebuild the plugin** from your IDE and restart the editor. Pure Python changes under `Server/` only need an MCP client restart.
 
 ---
 
@@ -476,6 +517,40 @@ This plugin is for **local development use only.**
 
 ---
 
+## FAQ
+
+**Does this work with OpenAI's models / GPT-4 / Codex CLI?**
+Yes — UnrealMCP is client-agnostic. Any MCP-compatible client with any LLM backend works. For 128k-context models, use `DYNAMIC_MODE=1` so the plugin fits comfortably.
+
+**Do I need a paid Claude subscription?**
+No — the plugin runs in Unreal and is free. You need *some* MCP client; many are free. Claude Desktop has a free tier. Claude API / Cursor / Windsurf / Codex have their own pricing.
+
+**Will this mess up my project?**
+It *can*. The plugin drives the editor with full permissions — it can spawn, modify, and delete actors and assets just like you clicking in the editor. Always work in source control. There's a protected-path validator preventing engine-content writes, but project-content writes are on you.
+
+**Will AI-generated content be good?**
+Mixed. Simple tasks (spawn actors, build straightforward widgets, clean up folder structure) work well. Complex multi-system work (designing a full HUD, authoring a complete behavior tree, building material graphs with 30+ nodes) is iterative — expect to review and fix. Treat it as a fast-typing junior, not an architect.
+
+**Can I run this in shipped builds?**
+No. It's an editor-only plugin. `WhitelistPlatforms` is already scoped to editor targets; the TCP server is intentionally localhost + no auth. Ship builds will not include it.
+
+**Does it work on Mac / Linux?**
+The `WhitelistPlatforms` block in `UnrealMCP.uplugin` includes Win64, Mac, and Linux. Only Windows is actively tested — other platforms are expected to work but unverified. Please file issues.
+
+**Why 449 tools?**
+Because trying to cover "everything you might do in Unreal" gets you there fast. Most tasks use fewer than 10. `DYNAMIC_MODE=1` means the AI only loads what it needs per task.
+
+**How do I turn off Niagara tools since they don't work?**
+Set `ENABLED_MODULES` in your `.mcp.json` env to a list that excludes `niagara`. E.g. `"ENABLED_MODULES": "editor,blueprint,widget,material,behavior_tree"`.
+
+**How do I add a new tool?**
+Add the C++ handler in `Source/UnrealMCP/Private/Commands/`, register it in `UnrealMCPBridge.cpp`, add the Python wrapper with `@mcp.tool()` in the appropriate `Server/tools/*.py`. See [Contributing](#contributing) below. If you want it surfaced via `DYNAMIC_MODE`'s core tool list or in search keywords, edit `Server/tool_categories.py`.
+
+**Can two people share one Unreal editor via MCP?**
+No — the TCP server is bound to 127.0.0.1 and handles one command at a time. For pair workflows, each person runs their own editor + MCP server.
+
+---
+
 ## Troubleshooting
 
 **MCP client shows no tools after install.**
@@ -501,6 +576,18 @@ cd Plugins/UnrealMCP/Server
 python scripts/actors/test_cube.py
 python scripts/blueprints/test_create_and_spawn_cube_blueprint.py
 ```
+
+**Tool schemas not updating after changing `DYNAMIC_MODE` or `ENABLED_MODULES`.**
+`/mcp` style reconnects only re-establish the transport; they don't always re-fetch the tool catalog. **Fully quit and relaunch the MCP client** (Claude Code, Claude Desktop, Cursor, etc.) to force a fresh tool list.
+
+**DYNAMIC_MODE shows 22 tools but AI can't find a specific tool.**
+The AI needs to call `search_unreal_tools("<keyword>")` → `describe_unreal_tools([name])` → `execute_unreal_tool(name, params)`. If it's not doing that, make sure it has read the `search_unreal_tools` docstring (some clients truncate long descriptions -- the domain overview in the docstring is what teaches the LLM what's reachable).
+
+**Large tool responses get cut off.**
+Some responses (full `get_blueprint_snapshot` of a big BP, full `get_widget_hierarchy`) can be multi-thousand tokens. This is MCP-client behaviour, not the server. Use more targeted tools (`get_blueprint_variables`, `get_graph_nodes`) instead of snapshot-everything.
+
+**Server log location.**
+`Plugins/UnrealMCP/Server/unreal_mcp.log` — includes connection attempts, command dispatches, and responses. The first stop when debugging MCP-side issues.
 
 ---
 
