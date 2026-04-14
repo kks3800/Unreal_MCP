@@ -25,6 +25,8 @@
 #include "Engine/BlueprintGeneratedClass.h"
 #include "BlueprintNodeSpawner.h"
 #include "BlueprintActionDatabase.h"
+#include "BlueprintVariableNodeSpawner.h"
+#include "BlueprintNodeBinder.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 
@@ -287,60 +289,137 @@ UK2Node_CallFunction* FUnrealMCPCommonUtils::CreateFunctionCallNode(UEdGraph* Gr
     return FunctionNode;
 }
 
-UK2Node_VariableGet* FUnrealMCPCommonUtils::CreateVariableGetNode(UEdGraph* Graph, UBlueprint* Blueprint, const FString& VariableName, const FVector2D& Position)
+// ---------------------------------------------------------------------------
+// Variable node creation — uses the engine's UBlueprintVariableNodeSpawner,
+// the same path the UMG/Kismet editor takes when a variable is dragged from
+// the My Blueprint panel onto the graph. The spawner handles:
+//   - Self member vars
+//   - Parent-class inherited vars
+//   - Component references
+//   - bSelfContext computation for IsChildOf checks
+//
+// Previous implementation used UEdGraph::AddNode + VariableReference.SetSelfMember
+// directly, which failed for variables that had been authored but not yet
+// baked into Blueprint->GeneratedClass (i.e. every freshly-added variable
+// before a full compile). We now look through all four scopes and fall back
+// to a skeleton regeneration when necessary.
+// ---------------------------------------------------------------------------
+
+namespace
 {
-    if (!Graph || !Blueprint)
+    /** Search for a variable's FProperty across every scope the engine checks. */
+    FProperty* FindVariablePropertyInAnyScope(UBlueprint* Blueprint, FName VarName)
     {
+        if (!Blueprint)
+        {
+            return nullptr;
+        }
+
+        // 1. Skeleton class — updated on every blueprint save, even before full compile.
+        if (Blueprint->SkeletonGeneratedClass)
+        {
+            if (FProperty* P = FindFProperty<FProperty>(Blueprint->SkeletonGeneratedClass, VarName))
+            {
+                return P;
+            }
+        }
+
+        // 2. Fully compiled generated class.
+        if (Blueprint->GeneratedClass)
+        {
+            if (FProperty* P = FindFProperty<FProperty>(Blueprint->GeneratedClass, VarName))
+            {
+                return P;
+            }
+        }
+
+        // 3. Parent class hierarchy (inherited vars, components, engine properties).
+        if (UClass* Parent = Blueprint->ParentClass)
+        {
+            if (FProperty* P = FindFProperty<FProperty>(Parent, VarName))
+            {
+                return P;
+            }
+        }
+
         return nullptr;
     }
-    
-    UK2Node_VariableGet* VariableGetNode = NewObject<UK2Node_VariableGet>(Graph);
-    VariableGetNode->CreateNewGuid();
 
-    FName VarName(*VariableName);
-    FProperty* Property = FindFProperty<FProperty>(Blueprint->GeneratedClass, VarName);
-
-    if (Property)
+    /** Resolve a variable to its FProperty, forcing a skeleton regeneration if
+     *  the variable was just authored but hasn't yet been reflected in any class. */
+    FProperty* ResolveVariableProperty(UBlueprint* Blueprint, FName VarName)
     {
-        VariableGetNode->VariableReference.SetSelfMember(VarName);
-        VariableGetNode->NodePosX = Position.X;
-        VariableGetNode->NodePosY = Position.Y;
-        Graph->AddNode(VariableGetNode, false, false);
-        VariableGetNode->PostPlacedNewNode();
-        VariableGetNode->AllocateDefaultPins();
-        
-        return VariableGetNode;
+        if (FProperty* P = FindVariablePropertyInAnyScope(Blueprint, VarName))
+        {
+            return P;
+        }
+
+        // Variable may be in Blueprint->NewVariables but not yet in the skeleton.
+        // Conform + refresh triggers a skeleton regeneration without a full compile.
+        if (FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, VarName) != INDEX_NONE)
+        {
+            FBlueprintEditorUtils::RefreshVariables(Blueprint);
+            return FindVariablePropertyInAnyScope(Blueprint, VarName);
+        }
+
+        return nullptr;
     }
-    
-    return nullptr;
+
+    /** Core spawn helper shared by Get/Set — invokes the engine's variable spawner. */
+    UK2Node_Variable* SpawnVariableNode(
+        UEdGraph* Graph,
+        UBlueprint* Blueprint,
+        const FString& VariableName,
+        TSubclassOf<UK2Node_Variable> NodeClass,
+        const FVector2D& Position)
+    {
+        if (!Graph || !Blueprint || !NodeClass)
+        {
+            return nullptr;
+        }
+
+        const FName VarName(*VariableName);
+        FProperty* Property = ResolveVariableProperty(Blueprint, VarName);
+        if (!Property)
+        {
+            return nullptr;
+        }
+
+        // OwnerClass selection: use the property's actual owner when available
+        // (handles inherited vars); otherwise the blueprint's skeleton class.
+        UClass* OwnerClass = Property->GetOwnerClass();
+        if (!OwnerClass)
+        {
+            OwnerClass = Blueprint->SkeletonGeneratedClass;
+        }
+
+        UBlueprintVariableNodeSpawner* Spawner = UBlueprintVariableNodeSpawner::CreateFromMemberOrParam(
+            NodeClass,
+            Property,
+            /*VarContext=*/ nullptr,   // only used for local variables; nullptr for member
+            OwnerClass);
+
+        if (!Spawner)
+        {
+            return nullptr;
+        }
+
+        IBlueprintNodeBinder::FBindingSet Bindings;
+        UEdGraphNode* NewNode = Spawner->Invoke(Graph, Bindings, Position);
+        return Cast<UK2Node_Variable>(NewNode);
+    }
+}
+
+UK2Node_VariableGet* FUnrealMCPCommonUtils::CreateVariableGetNode(UEdGraph* Graph, UBlueprint* Blueprint, const FString& VariableName, const FVector2D& Position)
+{
+    return Cast<UK2Node_VariableGet>(SpawnVariableNode(
+        Graph, Blueprint, VariableName, UK2Node_VariableGet::StaticClass(), Position));
 }
 
 UK2Node_VariableSet* FUnrealMCPCommonUtils::CreateVariableSetNode(UEdGraph* Graph, UBlueprint* Blueprint, const FString& VariableName, const FVector2D& Position)
 {
-    if (!Graph || !Blueprint)
-    {
-        return nullptr;
-    }
-    
-    UK2Node_VariableSet* VariableSetNode = NewObject<UK2Node_VariableSet>(Graph);
-    VariableSetNode->CreateNewGuid();
-
-    FName VarName(*VariableName);
-    FProperty* Property = FindFProperty<FProperty>(Blueprint->GeneratedClass, VarName);
-
-    if (Property)
-    {
-        VariableSetNode->VariableReference.SetSelfMember(VarName);
-        VariableSetNode->NodePosX = Position.X;
-        VariableSetNode->NodePosY = Position.Y;
-        Graph->AddNode(VariableSetNode, false, false);
-        VariableSetNode->PostPlacedNewNode();
-        VariableSetNode->AllocateDefaultPins();
-        
-        return VariableSetNode;
-    }
-    
-    return nullptr;
+    return Cast<UK2Node_VariableSet>(SpawnVariableNode(
+        Graph, Blueprint, VariableName, UK2Node_VariableSet::StaticClass(), Position));
 }
 
 UK2Node_InputAction* FUnrealMCPCommonUtils::CreateInputActionNode(UEdGraph* Graph, const FString& ActionName, const FVector2D& Position)
