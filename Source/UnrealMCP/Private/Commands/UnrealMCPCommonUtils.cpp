@@ -27,6 +27,7 @@
 #include "BlueprintActionDatabase.h"
 #include "BlueprintVariableNodeSpawner.h"
 #include "BlueprintNodeBinder.h"
+#include "Kismet/BlueprintFunctionLibrary.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 
@@ -276,7 +277,7 @@ UK2Node_CallFunction* FUnrealMCPCommonUtils::CreateFunctionCallNode(UEdGraph* Gr
     {
         return nullptr;
     }
-    
+
     UK2Node_CallFunction* FunctionNode = NewObject<UK2Node_CallFunction>(Graph);
     FunctionNode->SetFromFunction(Function);
     FunctionNode->NodePosX = Position.X;
@@ -285,8 +286,179 @@ UK2Node_CallFunction* FUnrealMCPCommonUtils::CreateFunctionCallNode(UEdGraph* Gr
     FunctionNode->CreateNewGuid();
     FunctionNode->PostPlacedNewNode();
     FunctionNode->AllocateDefaultPins();
-    
+
     return FunctionNode;
+}
+
+// ---------------------------------------------------------------------------
+// Function lookup — resolves a BlueprintCallable function across the common
+// calling conventions. Replaces the previous 150-line hand-rolled path-prefix
+// ladder in HandleAddBlueprintFunctionCall that failed on KismetMathLibrary
+// (and most function libraries) because FindObject<UClass>(nullptr, ...) no
+// longer finds library classes without an explicit package path in UE 5.x.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+    /** Find a function on a single class, with a case-insensitive fallback. */
+    UFunction* FindFunctionOnClass(UClass* Class, const FString& FunctionName)
+    {
+        if (!Class || FunctionName.IsEmpty())
+        {
+            return nullptr;
+        }
+        if (UFunction* Exact = Class->FindFunctionByName(*FunctionName))
+        {
+            return Exact;
+        }
+        for (TFieldIterator<UFunction> It(Class); It; ++It)
+        {
+            if (It->GetName().Equals(FunctionName, ESearchCase::IgnoreCase))
+            {
+                return *It;
+            }
+        }
+        return nullptr;
+    }
+
+    /** Try to resolve a UClass from a short name or script path. */
+    UClass* ResolveTargetClass(const FString& TargetClassName)
+    {
+        if (TargetClassName.IsEmpty())
+        {
+            return nullptr;
+        }
+
+        // Full script path — load directly.
+        if (TargetClassName.StartsWith(TEXT("/Script/")))
+        {
+            return LoadObject<UClass>(nullptr, *TargetClassName);
+        }
+
+        // Build a list of candidates:
+        //   1. The name as-is               ("KismetMathLibrary")
+        //   2. With "U" prefix              ("UKismetMathLibrary")
+        //   3. Engine script path           ("/Script/Engine.KismetMathLibrary")
+        //   4. CoreUObject script path      ("/Script/CoreUObject.KismetMathLibrary")
+        TArray<FString> Candidates;
+        Candidates.Add(TargetClassName);
+        if (!TargetClassName.StartsWith(TEXT("U")))
+        {
+            Candidates.Add(TEXT("U") + TargetClassName);
+        }
+        Candidates.Add(FString::Printf(TEXT("/Script/Engine.%s"), *TargetClassName));
+        Candidates.Add(FString::Printf(TEXT("/Script/CoreUObject.%s"), *TargetClassName));
+
+        // Try each candidate — LoadObject for paths, FindFirstObject for short names.
+        for (const FString& Candidate : Candidates)
+        {
+            UClass* Found = nullptr;
+            if (Candidate.Contains(TEXT("/")))
+            {
+                Found = LoadObject<UClass>(nullptr, *Candidate);
+            }
+            else
+            {
+                Found = FindFirstObject<UClass>(*Candidate, EFindFirstObjectOptions::NativeFirst);
+            }
+            if (Found)
+            {
+                return Found;
+            }
+        }
+
+        // Last-resort scan of loaded classes for a name match.
+        for (TObjectIterator<UClass> It; It; ++It)
+        {
+            const FString Name = It->GetName();
+            if (Name == TargetClassName || Name == TEXT("U") + TargetClassName)
+            {
+                return *It;
+            }
+        }
+
+        return nullptr;
+    }
+}
+
+UFunction* FUnrealMCPCommonUtils::FindCallableFunction(
+    const FString& TargetClassName,
+    const FString& FunctionName,
+    UBlueprint* ContextBlueprint)
+{
+    if (FunctionName.IsEmpty())
+    {
+        return nullptr;
+    }
+
+    // 1. No target class specified — search in the blueprint's own class and
+    //    then every BlueprintFunctionLibrary. This is what the Kismet editor
+    //    does when you type a function name into the action search.
+    if (TargetClassName.IsEmpty())
+    {
+        if (ContextBlueprint)
+        {
+            if (ContextBlueprint->SkeletonGeneratedClass)
+            {
+                if (UFunction* F = FindFunctionOnClass(ContextBlueprint->SkeletonGeneratedClass, FunctionName))
+                {
+                    return F;
+                }
+            }
+            if (ContextBlueprint->GeneratedClass)
+            {
+                if (UFunction* F = FindFunctionOnClass(ContextBlueprint->GeneratedClass, FunctionName))
+                {
+                    return F;
+                }
+            }
+            if (UClass* Parent = ContextBlueprint->ParentClass)
+            {
+                if (UFunction* F = FindFunctionOnClass(Parent, FunctionName))
+                {
+                    return F;
+                }
+            }
+        }
+        for (TObjectIterator<UClass> It; It; ++It)
+        {
+            UClass* Class = *It;
+            if (!Class || Class->HasAnyClassFlags(CLASS_Abstract))
+            {
+                continue;
+            }
+            if (!Class->IsChildOf(UBlueprintFunctionLibrary::StaticClass()))
+            {
+                continue;
+            }
+            if (UFunction* F = FindFunctionOnClass(Class, FunctionName))
+            {
+                return F;
+            }
+        }
+        return nullptr;
+    }
+
+    // 2. Target class specified — resolve then look up function.
+    UClass* TargetClass = ResolveTargetClass(TargetClassName);
+    if (!TargetClass)
+    {
+        return nullptr;
+    }
+
+    // Search the target class, then climb the parent hierarchy (catches
+    // functions declared on a supertype and inherited by the target).
+    UClass* Current = TargetClass;
+    while (Current)
+    {
+        if (UFunction* F = FindFunctionOnClass(Current, FunctionName))
+        {
+            return F;
+        }
+        Current = Current->GetSuperClass();
+    }
+
+    return nullptr;
 }
 
 // ---------------------------------------------------------------------------

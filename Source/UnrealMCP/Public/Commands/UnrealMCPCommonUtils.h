@@ -44,6 +44,25 @@ public:
     // Blueprint node utilities
     static UK2Node_Event* CreateEventNode(UEdGraph* Graph, const FString& EventName, const FVector2D& Position);
     static UK2Node_CallFunction* CreateFunctionCallNode(UEdGraph* Graph, UFunction* Function, const FVector2D& Position);
+
+    /**
+     * Resolve a BlueprintCallable function by target class and function name.
+     *
+     * Handles the common calling conventions clients use:
+     *   - Empty target:  searches the blueprint's own class, then every
+     *                    UBlueprintFunctionLibrary subclass.
+     *   - Script path:   "/Script/Engine.KismetMathLibrary" — loaded directly.
+     *   - Short name:    "KismetMathLibrary" — tries with/without "U" prefix
+     *                    and a few canonical engine packages.
+     *   - Fallback:      scans every loaded UClass for a name match.
+     *
+     * Returns nullptr if no matching function is found. Case-insensitive on
+     * function name as a last resort (most UE math ops use CamelCase exactly).
+     */
+    static UFunction* FindCallableFunction(
+        const FString& TargetClassName,
+        const FString& FunctionName,
+        UBlueprint* ContextBlueprint = nullptr);
     static UK2Node_VariableGet* CreateVariableGetNode(UEdGraph* Graph, UBlueprint* Blueprint, const FString& VariableName, const FVector2D& Position);
     static UK2Node_VariableSet* CreateVariableSetNode(UEdGraph* Graph, UBlueprint* Blueprint, const FString& VariableName, const FVector2D& Position);
     static UK2Node_InputAction* CreateInputActionNode(UEdGraph* Graph, const FString& ActionName, const FVector2D& Position);
