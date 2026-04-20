@@ -44,7 +44,10 @@
 #include "K2Node_Message.h"
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_AddDelegate.h"
+#include "K2Node_ComponentBoundEvent.h"
 #include "EdGraphUtilities.h"
+#include "UObject/UnrealType.h"
+#include "UObject/UObjectIterator.h"
 #include "Engine/TimelineTemplate.h"
 #include "Curves/CurveFloat.h"
 #include "Net/UnrealNetwork.h"
@@ -159,6 +162,10 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleCommand(const FSt
     else if (CommandType == TEXT("add_format_text_node")) { return HandleAddFormatTextNode(Params); }
     else if (CommandType == TEXT("add_select_node")) { return HandleAddSelectNode(Params); }
     else if (CommandType == TEXT("add_interface_message_node")) { return HandleAddInterfaceMessageNode(Params); }
+    // Rework: introspection + richer structural nodes
+    else if (CommandType == TEXT("describe_node_pins")) { return HandleDescribeNodePins(Params); }
+    else if (CommandType == TEXT("add_dynamic_cast_node")) { return HandleAddDynamicCastNode(Params); }
+    else if (CommandType == TEXT("add_component_bound_event_node")) { return HandleAddComponentBoundEventNode(Params); }
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unknown blueprint node command: %s"), *CommandType));
 }
@@ -251,19 +258,134 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleConnectBlueprintN
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Source or target node not found"));
     }
 
-    // Connect the nodes
-    if (FUnrealMCPCommonUtils::ConnectGraphNodes(TargetGraph, SourceNode, SourcePinName, TargetNode, TargetPinName))
+    // Locate the specific pins. Let the source pin be an output and the target an input when
+    // ambiguous so callers can supply pin names without specifying direction.
+    UEdGraphPin* SourcePin = FUnrealMCPCommonUtils::FindPin(SourceNode, SourcePinName, EGPD_Output);
+    if (!SourcePin)
     {
-        // Mark the blueprint as modified
-        if (!FMCPBlueprintContext::Get().IsEditing()) { FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint); }
-
-        TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
-        ResultObj->SetStringField(TEXT("source_node_id"), SourceNodeId);
-        ResultObj->SetStringField(TEXT("target_node_id"), TargetNodeId);
-        return ResultObj;
+        SourcePin = FUnrealMCPCommonUtils::FindPin(SourceNode, SourcePinName, EGPD_MAX);
+    }
+    UEdGraphPin* TargetPin = FUnrealMCPCommonUtils::FindPin(TargetNode, TargetPinName, EGPD_Input);
+    if (!TargetPin)
+    {
+        TargetPin = FUnrealMCPCommonUtils::FindPin(TargetNode, TargetPinName, EGPD_MAX);
     }
 
-    return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to connect nodes"));
+    if (!SourcePin || !TargetPin)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Pin not found (source='%s', target='%s')"), *SourcePinName, *TargetPinName));
+    }
+
+    // Route through the K2 schema so we get free autocast + break-others + promotion.
+    const UEdGraphSchema_K2* K2Schema = Cast<UEdGraphSchema_K2>(TargetGraph->GetSchema());
+    if (!K2Schema)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Graph schema is not K2-compatible"));
+    }
+
+    // Idempotent connection: detect when SourcePin is already effectively
+    // connected to TargetPin (directly, or transitively through an existing
+    // autocast conversion node). Without this, re-running a build_blueprint_graph
+    // spec that needs autocast would leak a new Conv_* node every run because
+    // TryCreateConnection doesn't see the existing transitive path.
+    auto IsAutocastConvNode = [](const UEdGraphNode* N) -> bool
+    {
+        const UK2Node_CallFunction* Fn = Cast<UK2Node_CallFunction>(N);
+        if (!Fn) { return false; }
+        const FName MemberName = Fn->FunctionReference.GetMemberName();
+        // Conv_XxxToYyy is the canonical autocast naming convention.
+        return MemberName.ToString().StartsWith(TEXT("Conv_"));
+    };
+
+    // Direct link check.
+    if (SourcePin->LinkedTo.Contains(TargetPin))
+    {
+        TSharedPtr<FJsonObject> SkipObj = MakeShared<FJsonObject>();
+        SkipObj->SetBoolField(TEXT("success"), true);
+        SkipObj->SetStringField(TEXT("source_node_id"), SourceNodeId);
+        SkipObj->SetStringField(TEXT("target_node_id"), TargetNodeId);
+        SkipObj->SetStringField(TEXT("response_code"), TEXT("ALREADY_CONNECTED"));
+        SkipObj->SetBoolField(TEXT("conversion_inserted"), false);
+        SkipObj->SetStringField(TEXT("message"), TEXT("Pins already connected; no-op."));
+        return SkipObj;
+    }
+
+    // Transitive link via autocast Conv node check.
+    for (UEdGraphPin* FwdPin : SourcePin->LinkedTo)
+    {
+        if (!FwdPin || !FwdPin->GetOwningNode()) { continue; }
+        if (!IsAutocastConvNode(FwdPin->GetOwningNode())) { continue; }
+        // Is this Conv's output pin connected to TargetPin?
+        for (UEdGraphPin* ConvPin : FwdPin->GetOwningNode()->Pins)
+        {
+            if (!ConvPin || ConvPin->Direction != EGPD_Output) { continue; }
+            if (ConvPin->LinkedTo.Contains(TargetPin))
+            {
+                TSharedPtr<FJsonObject> SkipObj = MakeShared<FJsonObject>();
+                SkipObj->SetBoolField(TEXT("success"), true);
+                SkipObj->SetStringField(TEXT("source_node_id"), SourceNodeId);
+                SkipObj->SetStringField(TEXT("target_node_id"), TargetNodeId);
+                SkipObj->SetStringField(TEXT("response_code"), TEXT("ALREADY_CONNECTED_VIA_AUTOCAST"));
+                SkipObj->SetBoolField(TEXT("conversion_inserted"), false);
+                SkipObj->SetStringField(TEXT("message"),
+                    FString::Printf(TEXT("Already connected via existing %s; no-op."),
+                    *FwdPin->GetOwningNode()->GetNodeTitle(ENodeTitleType::ListView).ToString()));
+                return SkipObj;
+            }
+        }
+    }
+
+    const FPinConnectionResponse Response = K2Schema->CanCreateConnection(SourcePin, TargetPin);
+    const ECanCreateConnectionResponse ResponseCode = Response.Response;
+
+    if (ResponseCode == CONNECT_RESPONSE_DISALLOW)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Cannot connect: %s"), *Response.Message.ToString()));
+    }
+
+    // TryCreateConnection handles MAKE, BREAK_OTHERS_*, MAKE_WITH_CONVERSION_NODE (inserts
+    // autocast node internally) and MAKE_WITH_PROMOTION.
+    const bool bConnected = K2Schema->TryCreateConnection(SourcePin, TargetPin);
+    if (!bConnected)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("TryCreateConnection failed: %s"), *Response.Message.ToString()));
+    }
+
+    if (!FMCPBlueprintContext::Get().IsEditing()) { FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint); }
+
+    // Translate the response code to a human string so clients can reason about what happened.
+    FString ResponseStr;
+    bool bConversionInserted = false;
+    bool bBrokeOthers = false;
+    switch (ResponseCode)
+    {
+        case CONNECT_RESPONSE_MAKE:                        ResponseStr = TEXT("MAKE"); break;
+        case CONNECT_RESPONSE_BREAK_OTHERS_A:              ResponseStr = TEXT("BREAK_OTHERS_A"); bBrokeOthers = true; break;
+        case CONNECT_RESPONSE_BREAK_OTHERS_B:              ResponseStr = TEXT("BREAK_OTHERS_B"); bBrokeOthers = true; break;
+        case CONNECT_RESPONSE_BREAK_OTHERS_AB:             ResponseStr = TEXT("BREAK_OTHERS_AB"); bBrokeOthers = true; break;
+        case CONNECT_RESPONSE_MAKE_WITH_CONVERSION_NODE:   ResponseStr = TEXT("MAKE_WITH_CONVERSION_NODE"); bConversionInserted = true; break;
+        case CONNECT_RESPONSE_MAKE_WITH_PROMOTION:         ResponseStr = TEXT("MAKE_WITH_PROMOTION"); break;
+        default:                                           ResponseStr = TEXT("UNKNOWN"); break;
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), true);
+    ResultObj->SetStringField(TEXT("source_node_id"), SourceNodeId);
+    ResultObj->SetStringField(TEXT("target_node_id"), TargetNodeId);
+    ResultObj->SetStringField(TEXT("response_code"), ResponseStr);
+    ResultObj->SetBoolField(TEXT("conversion_inserted"), bConversionInserted);
+    if (bBrokeOthers)
+    {
+        ResultObj->SetBoolField(TEXT("broke_existing_connections"), true);
+    }
+    if (!Response.Message.IsEmpty())
+    {
+        ResultObj->SetStringField(TEXT("message"), Response.Message.ToString());
+    }
+    return ResultObj;
 }
 
 TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddBlueprintGetSelfComponentReference(const TSharedPtr<FJsonObject>& Params)
@@ -1512,6 +1634,17 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddSwitchOnIntNod
     SwitchNode->PostPlacedNewNode();
     SwitchNode->AllocateDefaultPins();
 
+    // Optional: pre-populate case pins. The Switch defaults to just the Selection+Default+first-case
+    // layout; callers commonly want 2-8 cases. AddPinToSwitchNode is a virtual on UK2Node_Switch.
+    int32 CaseCount = 0;
+    if (Params->TryGetNumberField(TEXT("case_count"), CaseCount))
+    {
+        for (int32 Index = 1; Index < CaseCount; ++Index)
+        {
+            SwitchNode->AddPinToSwitchNode();
+        }
+    }
+
     if (!FMCPBlueprintContext::Get().IsEditing()) { FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint); }
 
     return FUnrealMCPCommonUtils::NodeToCompactJson(SwitchNode);
@@ -1548,6 +1681,26 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddSwitchOnString
     UK2Node_SwitchString* SwitchNode = NewObject<UK2Node_SwitchString>(Graph);
     SwitchNode->NodePosX = Position.X;
     SwitchNode->NodePosY = Position.Y;
+
+    // Seed case names BEFORE AllocateDefaultPins so the pins are created with the correct labels.
+    const TArray<TSharedPtr<FJsonValue>>* PinNamesJson = nullptr;
+    if (Params->TryGetArrayField(TEXT("pin_names"), PinNamesJson) && PinNamesJson)
+    {
+        for (const TSharedPtr<FJsonValue>& Value : *PinNamesJson)
+        {
+            if (Value.IsValid() && Value->Type == EJson::String)
+            {
+                SwitchNode->PinNames.Add(FName(*Value->AsString()));
+            }
+        }
+    }
+
+    bool bCaseSensitive = false;
+    if (Params->TryGetBoolField(TEXT("case_sensitive"), bCaseSensitive))
+    {
+        SwitchNode->bIsCaseSensitive = bCaseSensitive;
+    }
+
     Graph->AddNode(SwitchNode, true);
     SwitchNode->CreateNewGuid();
     SwitchNode->PostPlacedNewNode();
@@ -1606,8 +1759,13 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddSwitchOnEnumNo
         return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Enum not found: %s"), *EnumName));
     }
 
+#if ENGINE_MINOR_VERSION >= 4
     UK2Node_SwitchEnum* SwitchNode = NewObject<UK2Node_SwitchEnum>(Graph);
     SwitchNode->SetEnum(EnumType);
+#else
+    return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("SwitchOnEnum not supported on this engine version"));
+    UK2Node_SwitchEnum* SwitchNode = nullptr;
+#endif
     SwitchNode->NodePosX = Position.X;
     SwitchNode->NodePosY = Position.Y;
     Graph->AddNode(SwitchNode, true);
@@ -2822,8 +2980,36 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddMakeStructNode
         return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Struct type not found: %s"), *StructType));
     }
 
+    // Core engine structs (FVector, FRotator, FVector2D) carry the NativeMakeFunction metadata.
+    // UK2Node_MakeStruct silently converts them to the native UKismetMathLibrary::Make<X> call at
+    // load time, which invalidates the pin layout we just returned. Emit the function-call node
+    // directly so the pin names/GUIDs the caller receives are stable.
+    const FName NativeMakeMeta(TEXT("HasNativeMake"));
+    if (Struct->HasMetaData(NativeMakeMeta))
+    {
+        const FString NativeMakePath = Struct->GetMetaData(NativeMakeMeta);
+        FString FunctionOwner;
+        FString FunctionName;
+        if (NativeMakePath.Split(TEXT("."), &FunctionOwner, &FunctionName, ESearchCase::CaseSensitive, ESearchDir::FromEnd))
+        {
+            UFunction* MakeFunc = FUnrealMCPCommonUtils::FindCallableFunction(FunctionOwner, FunctionName, Blueprint);
+            if (MakeFunc)
+            {
+                UK2Node_CallFunction* CallNode = FUnrealMCPCommonUtils::CreateFunctionCallNode(Graph, MakeFunc, Position);
+                if (CallNode)
+                {
+                    if (!FMCPBlueprintContext::Get().IsEditing()) { FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint); }
+                    return FUnrealMCPCommonUtils::NodeToCompactJson(CallNode);
+                }
+            }
+        }
+    }
+
     UK2Node_MakeStruct* MakeStructNode = NewObject<UK2Node_MakeStruct>(Graph);
     MakeStructNode->StructType = Struct;
+    // Suppresses the "this node was made before the override-pin removal" deprecation path inside
+    // AllocateDefaultPins — required on any fresh MakeStruct authored after UE 4.22.
+    MakeStructNode->bMadeAfterOverridePinRemoval = true;
     MakeStructNode->NodePosX = Position.X;
     MakeStructNode->NodePosY = Position.Y;
     Graph->AddNode(MakeStructNode, true);
@@ -2878,8 +3064,31 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddBreakStructNod
         return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Struct type not found: %s"), *StructType));
     }
 
+    // Mirror MakeStruct's native dispatch so Break on FVector/FRotator/etc. also survives reload.
+    const FName NativeBreakMeta(TEXT("HasNativeBreak"));
+    if (Struct->HasMetaData(NativeBreakMeta))
+    {
+        const FString NativeBreakPath = Struct->GetMetaData(NativeBreakMeta);
+        FString FunctionOwner;
+        FString FunctionName;
+        if (NativeBreakPath.Split(TEXT("."), &FunctionOwner, &FunctionName, ESearchCase::CaseSensitive, ESearchDir::FromEnd))
+        {
+            UFunction* BreakFunc = FUnrealMCPCommonUtils::FindCallableFunction(FunctionOwner, FunctionName, Blueprint);
+            if (BreakFunc)
+            {
+                UK2Node_CallFunction* CallNode = FUnrealMCPCommonUtils::CreateFunctionCallNode(Graph, BreakFunc, Position);
+                if (CallNode)
+                {
+                    if (!FMCPBlueprintContext::Get().IsEditing()) { FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint); }
+                    return FUnrealMCPCommonUtils::NodeToCompactJson(CallNode);
+                }
+            }
+        }
+    }
+
     UK2Node_BreakStruct* BreakStructNode = NewObject<UK2Node_BreakStruct>(Graph);
     BreakStructNode->StructType = Struct;
+    BreakStructNode->bMadeAfterOverridePinRemoval = true;
     BreakStructNode->NodePosX = Position.X;
     BreakStructNode->NodePosY = Position.Y;
     Graph->AddNode(BreakStructNode, true);
@@ -2921,12 +3130,23 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddMakeArrayNode(
     }
 
     UK2Node_MakeArray* MakeArrayNode = NewObject<UK2Node_MakeArray>(Graph);
+
+    // UK2Node_MakeContainer::AllocateDefaultPins creates a single input (slot 0). Any extra slots
+    // are appended via AddInputPin after allocation. Callers pass num_inputs = desired total.
+    int32 NumInputs = 1;
+    Params->TryGetNumberField(TEXT("num_inputs"), NumInputs);
+    if (NumInputs < 1) { NumInputs = 1; }
+
     MakeArrayNode->NodePosX = Position.X;
     MakeArrayNode->NodePosY = Position.Y;
     Graph->AddNode(MakeArrayNode, true);
     MakeArrayNode->CreateNewGuid();
     MakeArrayNode->PostPlacedNewNode();
     MakeArrayNode->AllocateDefaultPins();
+    for (int32 Index = 1; Index < NumInputs; ++Index)
+    {
+        MakeArrayNode->AddInputPin();
+    }
 
     if (!FMCPBlueprintContext::Get().IsEditing()) { FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint); }
 
@@ -2962,12 +3182,22 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddMakeMapNode(co
     }
 
     UK2Node_MakeMap* MakeMapNode = NewObject<UK2Node_MakeMap>(Graph);
+
+    int32 NumInputs = 1;
+    Params->TryGetNumberField(TEXT("num_inputs"), NumInputs);
+    if (NumInputs < 1) { NumInputs = 1; }
+
     MakeMapNode->NodePosX = Position.X;
     MakeMapNode->NodePosY = Position.Y;
     Graph->AddNode(MakeMapNode, true);
     MakeMapNode->CreateNewGuid();
     MakeMapNode->PostPlacedNewNode();
     MakeMapNode->AllocateDefaultPins();
+    // MakeMap's AddInputPin override adds one Key/Value pair at a time.
+    for (int32 Index = 1; Index < NumInputs; ++Index)
+    {
+        MakeMapNode->AddInputPin();
+    }
 
     if (!FMCPBlueprintContext::Get().IsEditing()) { FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint); }
 
@@ -3003,12 +3233,21 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddMakeSetNode(co
     }
 
     UK2Node_MakeSet* MakeSetNode = NewObject<UK2Node_MakeSet>(Graph);
+
+    int32 NumInputs = 1;
+    Params->TryGetNumberField(TEXT("num_inputs"), NumInputs);
+    if (NumInputs < 1) { NumInputs = 1; }
+
     MakeSetNode->NodePosX = Position.X;
     MakeSetNode->NodePosY = Position.Y;
     Graph->AddNode(MakeSetNode, true);
     MakeSetNode->CreateNewGuid();
     MakeSetNode->PostPlacedNewNode();
     MakeSetNode->AllocateDefaultPins();
+    for (int32 Index = 1; Index < NumInputs; ++Index)
+    {
+        MakeSetNode->AddInputPin();
+    }
 
     if (!FMCPBlueprintContext::Get().IsEditing()) { FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint); }
 
@@ -4116,6 +4355,418 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddInterfaceMessa
 }
 
 // ============================================================================
+// Rework Phases 5-7: introspection + dynamic cast + component bound event
+// ============================================================================
+
+namespace MCPNodeHelpers
+{
+    /**
+     * Maps common K2Node short names to concrete UClass pointers.
+     * Caller passes the same short names surfaced in the editor palette
+     * ("Branch", "MakeArray", "Switch on Int"). We intentionally over-accept
+     * aliases so LLMs don't get stuck on capitalisation / whitespace quirks.
+     */
+    static UClass* ResolveK2NodeClass(const FString& ShortName)
+    {
+        // Normalise: strip spaces, lowercase for matching.
+        FString Key = ShortName;
+        Key = Key.Replace(TEXT(" "), TEXT(""));
+        Key = Key.Replace(TEXT("_"), TEXT(""));
+        Key.ToLowerInline();
+
+        struct FAliasEntry { const TCHAR* Alias; const TCHAR* ClassName; };
+        static const FAliasEntry Table[] =
+        {
+            { TEXT("branch"),                     TEXT("K2Node_IfThenElse") },
+            { TEXT("ifthenelse"),                 TEXT("K2Node_IfThenElse") },
+            { TEXT("sequence"),                   TEXT("K2Node_ExecutionSequence") },
+            { TEXT("executionsequence"),          TEXT("K2Node_ExecutionSequence") },
+            { TEXT("switchoninteger"),            TEXT("K2Node_SwitchInteger") },
+            { TEXT("switchonint"),                TEXT("K2Node_SwitchInteger") },
+            { TEXT("switchint"),                  TEXT("K2Node_SwitchInteger") },
+            { TEXT("switchinteger"),              TEXT("K2Node_SwitchInteger") },
+            { TEXT("switchonstring"),             TEXT("K2Node_SwitchString") },
+            { TEXT("switchstring"),               TEXT("K2Node_SwitchString") },
+            { TEXT("switchonenum"),               TEXT("K2Node_SwitchEnum") },
+            { TEXT("switchenum"),                 TEXT("K2Node_SwitchEnum") },
+            { TEXT("makearray"),                  TEXT("K2Node_MakeArray") },
+            { TEXT("makemap"),                    TEXT("K2Node_MakeMap") },
+            { TEXT("makeset"),                    TEXT("K2Node_MakeSet") },
+            { TEXT("makestruct"),                 TEXT("K2Node_MakeStruct") },
+            { TEXT("breakstruct"),                TEXT("K2Node_BreakStruct") },
+            { TEXT("dynamiccast"),                TEXT("K2Node_DynamicCast") },
+            { TEXT("castto"),                     TEXT("K2Node_DynamicCast") },
+            { TEXT("cast"),                       TEXT("K2Node_DynamicCast") },
+            { TEXT("self"),                       TEXT("K2Node_Self") },
+            { TEXT("selfreference"),              TEXT("K2Node_Self") },
+            { TEXT("customevent"),                TEXT("K2Node_CustomEvent") },
+            { TEXT("reroute"),                    TEXT("K2Node_Knot") },
+            { TEXT("knot"),                       TEXT("K2Node_Knot") },
+            { TEXT("formattext"),                 TEXT("K2Node_FormatText") },
+            { TEXT("select"),                     TEXT("K2Node_Select") },
+            { TEXT("timeline"),                   TEXT("K2Node_Timeline") },
+            { TEXT("spawnactor"),                 TEXT("K2Node_SpawnActorFromClass") },
+            { TEXT("spawnactorfromclass"),        TEXT("K2Node_SpawnActorFromClass") },
+            { TEXT("constructobject"),            TEXT("K2Node_GenericCreateObject") },
+            { TEXT("calldelegate"),               TEXT("K2Node_CallDelegate") },
+            { TEXT("adddelegate"),                TEXT("K2Node_AddDelegate") },
+            { TEXT("bindevent"),                  TEXT("K2Node_AddDelegate") },
+            { TEXT("createevent"),                TEXT("K2Node_CreateDelegate") },
+            { TEXT("createdelegate"),             TEXT("K2Node_CreateDelegate") },
+            { TEXT("assigndelegate"),             TEXT("K2Node_AssignDelegate") },
+            { TEXT("componentboundevent"),        TEXT("K2Node_ComponentBoundEvent") },
+            { TEXT("interfacemessage"),           TEXT("K2Node_Message") },
+            { TEXT("callfunction"),               TEXT("K2Node_CallFunction") },
+            { TEXT("variableget"),                TEXT("K2Node_VariableGet") },
+            { TEXT("variableset"),                TEXT("K2Node_VariableSet") },
+            { TEXT("event"),                      TEXT("K2Node_Event") },
+            { TEXT("inputaction"),                TEXT("K2Node_InputAction") },
+        };
+
+        const TCHAR* CanonicalName = nullptr;
+        for (const FAliasEntry& Entry : Table)
+        {
+            if (Key.Equals(Entry.Alias))
+            {
+                CanonicalName = Entry.ClassName;
+                break;
+            }
+        }
+
+        // Fallback: use the raw input as-is. Accepts "UK2Node_MakeArray" style names too.
+        const FString LookupName = CanonicalName ? FString(CanonicalName) : ShortName;
+
+        // Try UClass lookup by short name first — fast path for loaded classes.
+        if (UClass* Found = FindFirstObject<UClass>(*LookupName, EFindFirstObjectOptions::NativeFirst))
+        {
+            if (Found->IsChildOf(UEdGraphNode::StaticClass()))
+            {
+                return Found;
+            }
+        }
+        // Try with the "U" prefix if the caller omitted it.
+        if (!LookupName.StartsWith(TEXT("U")))
+        {
+            if (UClass* Found = FindFirstObject<UClass>(*(TEXT("U") + LookupName), EFindFirstObjectOptions::ExactClass))
+            {
+                if (Found->IsChildOf(UEdGraphNode::StaticClass()))
+                {
+                    return Found;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    /** Same flexible resolution used elsewhere — consolidated here for describe/cast helpers. */
+    static UScriptStruct* ResolveStructByName(const FString& Name)
+    {
+        if (Name.IsEmpty()) { return nullptr; }
+        UScriptStruct* Struct = FindObject<UScriptStruct>(nullptr, *Name);
+        if (!Struct) { Struct = LoadObject<UScriptStruct>(nullptr, *Name); }
+        if (!Struct) { Struct = LoadObject<UScriptStruct>(nullptr, *(TEXT("/Script/CoreUObject.") + Name)); }
+        if (!Struct) { Struct = LoadObject<UScriptStruct>(nullptr, *(TEXT("/Script/Engine.") + Name)); }
+        return Struct;
+    }
+
+    static UEnum* ResolveEnumByName(const FString& Name)
+    {
+        if (Name.IsEmpty()) { return nullptr; }
+        UEnum* EnumType = FindObject<UEnum>(nullptr, *Name);
+        if (!EnumType) { EnumType = LoadObject<UEnum>(nullptr, *Name); }
+        if (!EnumType) { EnumType = LoadObject<UEnum>(nullptr, *(TEXT("/Script/Engine.") + Name)); }
+        if (!EnumType) { EnumType = LoadObject<UEnum>(nullptr, *(TEXT("/Script/CoreUObject.") + Name)); }
+        return EnumType;
+    }
+
+    static UClass* ResolveClassByName(const FString& Name)
+    {
+        if (Name.IsEmpty()) { return nullptr; }
+        UClass* Result = FindObject<UClass>(nullptr, *Name);
+        if (!Result) { Result = LoadObject<UClass>(nullptr, *Name); }
+        if (!Result) { Result = LoadObject<UClass>(nullptr, *(TEXT("/Script/Engine.") + Name)); }
+        if (!Result) { Result = LoadObject<UClass>(nullptr, *(TEXT("/Script/CoreUObject.") + Name)); }
+        return Result;
+    }
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleDescribeNodePins(const TSharedPtr<FJsonObject>& Params)
+{
+    FString NodeClassName;
+    if (!Params->TryGetStringField(TEXT("node_class"), NodeClassName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'node_class' parameter"));
+    }
+
+    UClass* NodeClass = MCPNodeHelpers::ResolveK2NodeClass(NodeClassName);
+    if (!NodeClass)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Unknown node class: %s"), *NodeClassName));
+    }
+    if (!NodeClass->IsChildOf(UEdGraphNode::StaticClass()))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Class is not an EdGraphNode subclass: %s"), *NodeClass->GetName()));
+    }
+
+    // Most K2Node AllocateDefaultPins implementations call CastChecked<UEdGraphSchema_K2>(GetSchema()),
+    // which asserts when ParentGraph is null. Build a throwaway K2 graph in the transient package
+    // and use it as the node's outer. It's never added to any Blueprint and gets GC'd.
+    UEdGraph* TempGraph = NewObject<UEdGraph>(
+        GetTransientPackage(),
+        UEdGraph::StaticClass(),
+        NAME_None,
+        RF_Transient);
+    TempGraph->Schema = UEdGraphSchema_K2::StaticClass();
+
+    UEdGraphNode* Template = NewObject<UEdGraphNode>(
+        TempGraph,
+        NodeClass,
+        NAME_None,
+        RF_Transient);
+
+    if (!Template)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Failed to instantiate transient node of class %s"), *NodeClass->GetName()));
+    }
+    TempGraph->AddNode(Template, /*bUserAction=*/ false, /*bSelectNewNode=*/ false);
+
+    // Apply any type parameters BEFORE AllocateDefaultPins so the generated layout reflects them.
+    FString StructTypeName;
+    if (Params->TryGetStringField(TEXT("struct_type"), StructTypeName) && !StructTypeName.IsEmpty())
+    {
+        UScriptStruct* Struct = MCPNodeHelpers::ResolveStructByName(StructTypeName);
+        if (Struct)
+        {
+            if (UK2Node_MakeStruct* MakeStruct = Cast<UK2Node_MakeStruct>(Template))
+            {
+                MakeStruct->StructType = Struct;
+                MakeStruct->bMadeAfterOverridePinRemoval = true;
+            }
+            else if (UK2Node_BreakStruct* BreakStruct = Cast<UK2Node_BreakStruct>(Template))
+            {
+                BreakStruct->StructType = Struct;
+                BreakStruct->bMadeAfterOverridePinRemoval = true;
+            }
+        }
+    }
+
+#if ENGINE_MINOR_VERSION >= 4
+    FString EnumTypeName;
+    if (Params->TryGetStringField(TEXT("enum_type"), EnumTypeName) && !EnumTypeName.IsEmpty())
+    {
+        if (UK2Node_SwitchEnum* SwitchEnum = Cast<UK2Node_SwitchEnum>(Template))
+        {
+            if (UEnum* EnumType = MCPNodeHelpers::ResolveEnumByName(EnumTypeName))
+            {
+                SwitchEnum->SetEnum(EnumType);
+            }
+        }
+    }
+#endif
+
+    FString TargetClassName;
+    if (Params->TryGetStringField(TEXT("target_class"), TargetClassName) && !TargetClassName.IsEmpty())
+    {
+        if (UK2Node_DynamicCast* CastNode = Cast<UK2Node_DynamicCast>(Template))
+        {
+            if (UClass* TargetClass = MCPNodeHelpers::ResolveClassByName(TargetClassName))
+            {
+                CastNode->TargetType = TargetClass;
+                bool bPureCast = false;
+                if (Params->TryGetBoolField(TEXT("is_pure"), bPureCast))
+                {
+                    CastNode->SetPurity(bPureCast);
+                }
+            }
+        }
+    }
+
+    // TODO: describing UK2Node_ComponentBoundEvent / UK2Node_CallFunction with real signatures
+    // requires a live Blueprint context — callers interested in those should spawn the node
+    // directly and read its pins afterwards. For now we allocate the default (untyped) layout.
+    Template->AllocateDefaultPins();
+
+    TSharedPtr<FJsonObject> OutObj = MakeShared<FJsonObject>();
+    OutObj->SetStringField(TEXT("node_class"), NodeClass->GetName());
+    OutObj->SetStringField(TEXT("resolved_name"), Template->GetNodeTitle(ENodeTitleType::ListView).ToString());
+
+    TArray<TSharedPtr<FJsonValue>> PinArray;
+    for (UEdGraphPin* Pin : Template->Pins)
+    {
+        if (!Pin) { continue; }
+        TSharedPtr<FJsonObject> PinJson = FUnrealMCPCommonUtils::PinToJson(Pin, /*bIncludeConnections=*/ false);
+        if (PinJson.IsValid())
+        {
+            PinArray.Add(MakeShared<FJsonValueObject>(PinJson));
+        }
+    }
+    OutObj->SetArrayField(TEXT("pins"), PinArray);
+
+    // Mark transient so GC can reclaim the node + its owner graph promptly.
+    Template->MarkAsGarbage();
+    TempGraph->MarkAsGarbage();
+
+    return OutObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddDynamicCastNode(const TSharedPtr<FJsonObject>& Params)
+{
+    FString BlueprintName;
+    if (!Params->TryGetStringField(TEXT("blueprint_name"), BlueprintName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'blueprint_name' parameter"));
+    }
+
+    FString TargetClassName;
+    if (!Params->TryGetStringField(TEXT("target_class"), TargetClassName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'target_class' parameter"));
+    }
+
+    UBlueprint* Blueprint = FUnrealMCPCommonUtils::FindBlueprint(BlueprintName);
+    if (!Blueprint)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintName));
+    }
+
+    FString GraphName;
+    Params->TryGetStringField(TEXT("graph_name"), GraphName);
+    UEdGraph* Graph = GraphName.IsEmpty()
+        ? FUnrealMCPCommonUtils::FindOrCreateEventGraph(Blueprint)
+        : FUnrealMCPCommonUtils::FindGraphByName(Blueprint, GraphName);
+    if (!Graph)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Graph not found"));
+    }
+
+    FVector2D Position(0.0f, 0.0f);
+    if (Params->HasField(TEXT("position")))
+    {
+        Position = FUnrealMCPCommonUtils::GetVector2DFromJson(Params, TEXT("position"));
+    }
+
+    UClass* TargetClass = MCPNodeHelpers::ResolveClassByName(TargetClassName);
+    if (!TargetClass)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Target class not found: %s"), *TargetClassName));
+    }
+
+    UK2Node_DynamicCast* CastNode = NewObject<UK2Node_DynamicCast>(Graph);
+    CastNode->TargetType = TargetClass;
+
+    // Pure casts expose no exec pins — the result is evaluated every time the output is read.
+    // Pass explicitly when the caller asks for it so we don't flip Impure's default.
+    bool bPure = false;
+    if (Params->TryGetBoolField(TEXT("is_pure"), bPure))
+    {
+        CastNode->SetPurity(bPure);
+    }
+
+    CastNode->NodePosX = Position.X;
+    CastNode->NodePosY = Position.Y;
+    Graph->AddNode(CastNode, true);
+    CastNode->CreateNewGuid();
+    CastNode->PostPlacedNewNode();
+    CastNode->AllocateDefaultPins();
+
+    if (!FMCPBlueprintContext::Get().IsEditing()) { FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint); }
+
+    return FUnrealMCPCommonUtils::NodeToCompactJson(CastNode);
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddComponentBoundEventNode(const TSharedPtr<FJsonObject>& Params)
+{
+    FString BlueprintName;
+    if (!Params->TryGetStringField(TEXT("blueprint_name"), BlueprintName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'blueprint_name' parameter"));
+    }
+
+    FString ComponentName;
+    if (!Params->TryGetStringField(TEXT("component_name"), ComponentName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'component_name' parameter"));
+    }
+
+    FString DelegateName;
+    if (!Params->TryGetStringField(TEXT("delegate_name"), DelegateName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'delegate_name' parameter"));
+    }
+
+    UBlueprint* Blueprint = FUnrealMCPCommonUtils::FindBlueprint(BlueprintName);
+    if (!Blueprint)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintName));
+    }
+
+    // Look up the component UPROPERTY on the Blueprint's generated class. SkeletonGeneratedClass
+    // is what new UPROPERTY lookups should hit during editing (GeneratedClass may be stale before
+    // compile). Fall back to GeneratedClass if skeleton is null.
+    UClass* OwnerClass = Blueprint->SkeletonGeneratedClass ? Blueprint->SkeletonGeneratedClass : Blueprint->GeneratedClass;
+    if (!OwnerClass)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Blueprint has no generated class (compile the blueprint first)"));
+    }
+
+    FObjectProperty* ComponentProperty = FindFProperty<FObjectProperty>(OwnerClass, *ComponentName);
+    if (!ComponentProperty)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Component property not found: %s on %s"), *ComponentName, *OwnerClass->GetName()));
+    }
+
+    UClass* ComponentClass = ComponentProperty->PropertyClass;
+    if (!ComponentClass)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Component property '%s' has no PropertyClass"), *ComponentName));
+    }
+
+    FMulticastDelegateProperty* DelegateProperty = FindFProperty<FMulticastDelegateProperty>(ComponentClass, *DelegateName);
+    if (!DelegateProperty)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Delegate '%s' not found on %s"), *DelegateName, *ComponentClass->GetName()));
+    }
+
+    FString GraphName;
+    Params->TryGetStringField(TEXT("graph_name"), GraphName);
+    UEdGraph* Graph = GraphName.IsEmpty()
+        ? FUnrealMCPCommonUtils::FindOrCreateEventGraph(Blueprint)
+        : FUnrealMCPCommonUtils::FindGraphByName(Blueprint, GraphName);
+    if (!Graph)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Graph not found"));
+    }
+
+    FVector2D Position(0.0f, 0.0f);
+    if (Params->HasField(TEXT("position")))
+    {
+        Position = FUnrealMCPCommonUtils::GetVector2DFromJson(Params, TEXT("position"));
+    }
+
+    UK2Node_ComponentBoundEvent* BoundEventNode = NewObject<UK2Node_ComponentBoundEvent>(Graph);
+    // InitializeComponentBoundEventParams copies names/owners into the node's fields. Must be
+    // called BEFORE AllocateDefaultPins so the generated event signature matches the delegate.
+    BoundEventNode->InitializeComponentBoundEventParams(ComponentProperty, DelegateProperty);
+    BoundEventNode->NodePosX = Position.X;
+    BoundEventNode->NodePosY = Position.Y;
+    Graph->AddNode(BoundEventNode, true);
+    BoundEventNode->CreateNewGuid();
+    BoundEventNode->PostPlacedNewNode();
+    BoundEventNode->AllocateDefaultPins();
+
+    if (!FMCPBlueprintContext::Get().IsEditing()) { FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint); }
+
+    return FUnrealMCPCommonUtils::NodeToCompactJson(BoundEventNode);
+}
+
+// ============================================================================
 // COMMAND REGISTRATION
 // ============================================================================
 
@@ -4237,4 +4888,11 @@ void FUnrealMCPBlueprintNodeCommands::RegisterCommands(FMCPCommandRegistry& Regi
 		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("add_select_node"), P); });
 	Registry.RegisterCommand(TEXT("add_interface_message_node"),
 		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("add_interface_message_node"), P); });
+	// Rework: introspection + structural nodes
+	Registry.RegisterCommand(TEXT("describe_node_pins"),
+		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("describe_node_pins"), P); });
+	Registry.RegisterCommand(TEXT("add_dynamic_cast_node"),
+		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("add_dynamic_cast_node"), P); });
+	Registry.RegisterCommand(TEXT("add_component_bound_event_node"),
+		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("add_component_bound_event_node"), P); });
 }

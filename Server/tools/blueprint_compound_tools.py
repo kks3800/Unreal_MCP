@@ -19,18 +19,38 @@ def register_blueprint_compound_tools(mcp: FastMCP):
     @mcp.tool()
     def get_blueprint_snapshot(
         ctx: Context,
-        blueprint_name: str
+        blueprint_name: str,
+        detail_level: str = "full"
     ) -> Dict[str, Any]:
         """
-        Get a complete snapshot of a Blueprint in a single call.
+        Get a snapshot of a Blueprint in a single call.
         Combines: get_blueprint_info + get_blueprint_variables + get_blueprint_graphs + get_compile_status.
-        Saves 3 round-trips (75% reduction for inspection).
+
+        TIERED OUTPUT (detail_level):
+            - "minimal":  name, parent_class, compile_status, + counts only (variable_count,
+                          component_count, graph_count). Smallest payload — use to check
+                          "does this blueprint exist / is it compiled" without pulling the
+                          whole structure.
+            - "standard": Adds variable/component/graph lists with NAMES + TYPES only.
+                          No default values, no exposure flags, no per-graph node counts.
+                          Roughly 40-60% smaller than full. Recommended default for
+                          large blueprints (50+ variables/components).
+            - "full" (DEFAULT): Everything — variables with defaults/exposure/category,
+                          components with parent, graphs with node counts.
+
+        BACKWARD COMPAT: default is "full" to preserve behavior for existing callers
+        (blueprint_intelligence relies on full variable/component detail). Pass
+        "standard" or "minimal" explicitly for token-efficient inspection.
+
+        Unknown detail_level values fall back to "full" with a warning field in the
+        response (data.detail_level_warning).
 
         Args:
             blueprint_name: Name of the Blueprint to inspect.
+            detail_level: "minimal" | "standard" | "full" (default: "full").
 
         Returns:
-            Complete Blueprint snapshot with info, variables, components, graphs, and compile status.
+            Blueprint snapshot. Shape varies by detail_level (see above).
         """
         from unreal_mcp_server import get_unreal_connection
 
@@ -40,7 +60,8 @@ def register_blueprint_compound_tools(mcp: FastMCP):
                 return {"success": False, "error": "Failed to connect to Unreal Engine"}
 
             response = unreal.send_command("get_blueprint_snapshot", {
-                "blueprint_name": blueprint_name
+                "blueprint_name": blueprint_name,
+                "detail_level": detail_level
             })
 
             if not response:
@@ -55,19 +76,43 @@ def register_blueprint_compound_tools(mcp: FastMCP):
     def get_graph_snapshot(
         ctx: Context,
         blueprint_name: str,
-        graph_name: str = "EventGraph"
+        graph_name: str = "EventGraph",
+        detail_level: str = "full"
     ) -> Dict[str, Any]:
         """
-        Get a complete snapshot of a Blueprint graph including all nodes with inline connection data.
+        Get a snapshot of a Blueprint graph's nodes with tiered detail.
         Combines: get_graph_nodes + get_blueprint_connections + get_unconnected_pins.
-        Saves 2 round-trips.
+
+        TIERED OUTPUT (detail_level) — rough per-node token cost:
+            - "minimal"  (~50 tok/node):  {guid, title, class} only. No pins, no positions,
+                          no connections. A 100-node graph ~5k tokens. Use for
+                          "what nodes exist?" / identity-only scans.
+            - "standard" (~150 tok/node): Adds pos_x/pos_y and pin names + directions
+                          (input/output). NO pin types, NO connected_to lists, NO
+                          default values. A 100-node graph ~15k tokens. Use for
+                          layout inspection or pin-name discovery without the wire
+                          topology.
+            - "full"    (~400 tok/node, DEFAULT): Everything — pin types, connected_to
+                          arrays ("NodeGUID:PinName"), and all metadata needed to
+                          reconstruct wiring. A 100-node graph ~40k tokens. Use when
+                          you need to trace execution or understand connections.
+
+        BACKWARD COMPAT: default is "full" to preserve existing callers
+        (blueprint_intelligence's graph analysis requires connected_to + pin types).
+        Pass "standard" or "minimal" explicitly for token-efficient inspection of
+        large graphs.
+
+        Unknown detail_level values fall back to "full" with a warning field in the
+        response (data.detail_level_warning).
 
         Args:
             blueprint_name: Name of the Blueprint.
             graph_name: Name of the graph (default: "EventGraph").
+            detail_level: "minimal" | "standard" | "full" (default: "full").
 
         Returns:
-            Graph snapshot with nodes, their pins, and inline connection data.
+            Graph snapshot. Top-level envelope unchanged: {success, data: {graph_name,
+            node_count, detail_level, nodes: [...]}}. Per-node shape varies by tier.
         """
         from unreal_mcp_server import get_unreal_connection
 
@@ -78,7 +123,8 @@ def register_blueprint_compound_tools(mcp: FastMCP):
 
             response = unreal.send_command("get_graph_snapshot", {
                 "blueprint_name": blueprint_name,
-                "graph_name": graph_name
+                "graph_name": graph_name,
+                "detail_level": detail_level
             })
 
             if not response:
@@ -635,6 +681,30 @@ def register_blueprint_compound_tools(mcp: FastMCP):
                     "blueprint_name": blueprint_name
                 })
 
+            # Phase 10 idempotency: fetch a snapshot of the target graph so the
+            # builder can skip add-ops for nodes that already exist by signature
+            # (Event/VariableGet/VariableSet/Function/SearchAction). If the
+            # snapshot call fails (graph doesn't exist yet, etc.), we silently
+            # fall back to non-idempotent behavior — the build still works, it
+            # just won't dedupe.
+            snapshot_result = None
+            try:
+                snapshot_response = unreal.send_command("get_graph_snapshot", {
+                    "blueprint_name": blueprint_name,
+                    "graph_name": graph_name,
+                    "detail_level": "minimal",
+                })
+                if (
+                    isinstance(snapshot_response, dict)
+                    and snapshot_response.get("status") != "error"
+                ):
+                    snapshot_result = snapshot_response
+            except Exception as snap_err:
+                logger.info(
+                    f"Graph snapshot skipped (continuing without dedup): {snap_err}"
+                )
+                snapshot_result = None
+
             # Build the operation list
             builder = BlueprintGraphBuilder()
             builder.load_spec(
@@ -644,36 +714,58 @@ def register_blueprint_compound_tools(mcp: FastMCP):
                 blueprint_name=blueprint_name,
                 graph_name=graph_name,
             )
+            if snapshot_result is not None:
+                builder.apply_graph_snapshot(snapshot_result)
             ops = builder.generate_ops()
 
-            if not ops:
+            if not ops and builder.reused_count == 0:
                 return {"success": False, "error": "No operations generated from spec"}
 
-            # Execute as a single batch
-            params = {
-                "blueprint_name": blueprint_name,
-                "operations": ops,
-                "auto_compile": auto_compile,
-                "auto_save": auto_save,
-            }
-            if auto_layout:
-                params["auto_layout"] = auto_layout
+            # Idempotent fast path: every spec node already exists AND there
+            # are no pin_defaults / new connections to emit. Nothing to do.
+            if not ops:
+                response = {
+                    "success": True,
+                    "success_count": 0,
+                    "fail_count": 0,
+                    "total_operations": 0,
+                    "results": [],
+                    "nodes_specified": len(nodes),
+                    "connections_specified": len(connections),
+                    "ops_generated": 0,
+                    "reused_count": builder.reused_count,
+                    "message": "All spec nodes already present; no changes needed.",
+                }
+            else:
+                # Execute as a single batch
+                params = {
+                    "blueprint_name": blueprint_name,
+                    "operations": ops,
+                    "auto_compile": auto_compile,
+                    "auto_save": auto_save,
+                }
+                if auto_layout:
+                    params["auto_layout"] = auto_layout
 
-            # Disable batch auto_compile — we'll compile separately for detailed results
-            params["auto_compile"] = False
+                # Disable batch auto_compile — we'll compile separately for detailed results
+                params["auto_compile"] = False
 
-            response = unreal.send_command("execute_blueprint_batch", params)
+                response = unreal.send_command("execute_blueprint_batch", params)
 
-            if not response:
-                return {"success": False, "error": "No response from Unreal Engine"}
+                if not response:
+                    return {"success": False, "error": "No response from Unreal Engine"}
 
-            # Add builder stats to response
-            if isinstance(response, dict):
-                result = response.get("result", response)
-                if isinstance(result, dict):
-                    result["nodes_specified"] = len(nodes)
-                    result["connections_specified"] = len(connections)
-                    result["ops_generated"] = len(ops)
+                # Add builder stats to response
+                if isinstance(response, dict):
+                    result = response.get("result", response)
+                    if isinstance(result, dict):
+                        result["nodes_specified"] = len(nodes)
+                        result["connections_specified"] = len(connections)
+                        result["ops_generated"] = len(ops)
+                        # Phase 10: surface dedup count to the caller so the LLM
+                        # can see that idempotency kicked in.
+                        if builder.reused_count > 0:
+                            result["reused_count"] = builder.reused_count
 
             # Compile with detailed results so errors are surfaced
             if auto_compile:

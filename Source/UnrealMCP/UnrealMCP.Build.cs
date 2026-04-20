@@ -1,27 +1,32 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 using UnrealBuildTool;
+using System.IO;
+using System.Text.RegularExpressions;
 
 public class UnrealMCP : ModuleRules
 {
+	// Detect engine minor version from Build.version JSON
+	private int GetEngineMinorVersion()
+	{
+		string VersionFile = Path.Combine(EngineDirectory, "Build", "Build.version");
+		if (File.Exists(VersionFile))
+		{
+			string Content = File.ReadAllText(VersionFile);
+			Match M = Regex.Match(Content, "\"MinorVersion\"\\s*:\\s*(\\d+)");
+			if (M.Success) return int.Parse(M.Groups[1].Value);
+		}
+		return 0;
+	}
+
 	public UnrealMCP(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
-		// Use IWYUSupport instead of the deprecated bEnforceIWYU in UE5.5
-		IWYUSupport = IWYUSupport.Full;
 
-		PublicIncludePaths.AddRange(
-			new string[] {
-				// ... add public include paths required here ...
-			}
-		);
-		
-		PrivateIncludePaths.AddRange(
-			new string[] {
-				// ... add other private include paths required here ...
-			}
-		);
-		
+		int MinorVer = GetEngineMinorVersion();
+
+		// IWYU: bEnforceIWYU (5.3) vs IWYUSupport (5.5+) — skip to avoid compat issues
+
 		PublicDependencyModuleNames.AddRange(
 			new string[]
 			{
@@ -37,7 +42,7 @@ public class UnrealMCP : ModuleRules
 				"DeveloperSettings"
 			}
 		);
-		
+
 		PrivateDependencyModuleNames.AddRange(
 			new string[]
 			{
@@ -53,54 +58,72 @@ public class UnrealMCP : ModuleRules
 				"Projects",
 				"AssetRegistry",
 				"CommonUI",
-				// MovieScene modules for widget animations
 				"MovieScene",
 				"MovieSceneTracks"
 			}
 		);
-		
-		if (Target.bBuildEditor == true)
+
+		if (Target.bBuildEditor)
 		{
+			// Always-available editor modules
 			PrivateDependencyModuleNames.AddRange(
 				new string[]
 				{
-					"PropertyEditor",      // For widget property editing
-					"ToolMenus",           // For editor UI
-					"BlueprintEditorLibrary", // For Blueprint utilities
-					"UMGEditor",          // For WidgetBlueprint.h and other UMG editor functionality
-					"MaterialEditor",      // For UMaterialEditingLibrary and material graph editing
-					// MetaSound modules for audio graph creation
-					"MetasoundEngine",     // Core MetaSound runtime and builder subsystem
-					"MetasoundFrontend",   // Document/graph structures and node registry
-					"MetasoundEditor",     // Editor utilities and factory classes
-					"MetasoundGraphCore", // Graph manipulation and node types
-					// Niagara modules for particle system creation
-					"Niagara",             // Core Niagara runtime (systems, emitters, renderers)
-					"NiagaraCore",         // Core types and utilities
-					"NiagaraEditor",       // Editor utilities and factory classes
-					// Asset management
-					"AssetTools",          // IAssetTools for redirector fixup
-				// AI / Behavior Tree modules
-				"AIModule",            // Core BT/BB runtime (UBehaviorTree, UBlackboardData)
-				"GameplayTasks",       // Required by AIModule task nodes
-				"GameplayTags",        // FGameplayTag for TagCooldown decorator
-				"BehaviorTreeEditor",  // BT graph nodes, factories
-				"AIGraph",             // AIGraphNode, AIGraphSchema
-				// Screenshot and image encoding
-				"ImageWrapper",        // IImageWrapper for editor screenshots
-				// ThumbnailTools is part of UnrealEd (already included above)
-				// Procedural Content Generation modules
-				"PCG",                 // PCG runtime (graphs, nodes, settings)
-				"PCGEditor",           // PCG editor (factory, asset utilities)
+					"PropertyEditor",
+					"ToolMenus",
+					"BlueprintEditorLibrary",
+					"UMGEditor",
+					"MaterialEditor",
+					"AssetTools",
+					"ImageWrapper",
+					// AI runtime (available in all UE5 versions)
+					"AIModule",
+					"GameplayTasks",
+					"GameplayTags",
 				}
 			);
-		}
-		
-		DynamicallyLoadedModuleNames.AddRange(
-			new string[]
+
+			// MetaSound modules
+			PrivateDependencyModuleNames.AddRange(
+				new string[]
+				{
+					"MetasoundEngine",
+					"MetasoundFrontend",
+					"MetasoundEditor",
+					"MetasoundGraphCore",
+				}
+			);
+
+			// Niagara modules
+			PrivateDependencyModuleNames.AddRange(
+				new string[]
+				{
+					"Niagara",
+					"NiagaraCore",
+					"NiagaraEditor",
+				}
+			);
+
+			// PCG modules (available in 5.3+ but experimental)
+			PrivateDependencyModuleNames.AddRange(
+				new string[]
+				{
+					"PCG",
+					"PCGEditor",
+				}
+			);
+
+			// BT editor graph nodes — symbols not exported before 5.4
+			if (MinorVer >= 4)
 			{
-				// ... add any modules that your module loads dynamically here ...
+				PrivateDependencyModuleNames.AddRange(
+					new string[]
+					{
+						"BehaviorTreeEditor",
+						"AIGraph",
+					}
+				);
 			}
-		);
+		}
 	}
-} 
+}

@@ -990,7 +990,11 @@ TSharedPtr<FJsonValue> FUnrealMCPPCGPropertyMarshaler::SerializePropertyToJson(
 		{
 			const FPCGAttributePropertySelector* Selector =
 				static_cast<const FPCGAttributePropertySelector*>(StructAddr);
+#if ENGINE_MINOR_VERSION >= 5
 			return MakeShared<FJsonValueString>(Selector->ToString());
+#else
+			return MakeShared<FJsonValueString>(Selector->GetName().ToString());
+#endif
 		}
 
 		// Fallback: object with each sub-property serialized recursively. Iterates
@@ -1045,7 +1049,12 @@ TSharedPtr<FJsonValue> FUnrealMCPPCGPropertyMarshaler::SerializePropertyToJson(
 			// SerializePropertyToJson's ContainerPtrToValuePtr call on PairPtr
 			// resolves to the value storage exactly once. Using GetValuePtr would
 			// double-offset past the value into the next pair.
+
+#if ENGINE_MINOR_VERSION >= 5
 			const uint8* PairPtr = MapHelper.GetKeyPtr(It);
+#else
+			const uint8* PairPtr = MapHelper.GetKeyPtr(*It);
+#endif
 
 			FString KeyString;
 			MapHelper.GetKeyProperty()->ExportTextItem_Direct(KeyString, PairPtr, nullptr, nullptr, PPF_None);
@@ -1064,7 +1073,12 @@ TSharedPtr<FJsonValue> FUnrealMCPPCGPropertyMarshaler::SerializePropertyToJson(
 		Out.Reserve(SetHelper.Num());
 		for (FScriptSetHelper::FIterator It = SetHelper.CreateIterator(); It; ++It)
 		{
+
+#if ENGINE_MINOR_VERSION >= 5
 			const uint8* ElementPtr = SetHelper.GetElementPtr(It);
+#else
+			const uint8* ElementPtr = SetHelper.GetElementPtr(*It);
+#endif
 			Out.Add(SerializePropertyToJson(ElementPtr, SetHelper.GetElementProperty()));
 		}
 		return MakeShared<FJsonValueArray>(Out);

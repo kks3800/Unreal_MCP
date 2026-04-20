@@ -16,7 +16,8 @@
 #include "BehaviorTree/BTDecorator.h"
 #include "BehaviorTree/BTService.h"
 
-// BT Editor graph includes
+// BT Editor graph includes (not available/exported before 5.4)
+#if ENGINE_MINOR_VERSION >= 4
 #include "BehaviorTreeGraph.h"
 #include "BehaviorTreeGraphNode.h"
 #include "BehaviorTreeGraphNode_Root.h"
@@ -24,6 +25,7 @@
 #include "BehaviorTreeGraphNode_Task.h"
 #include "BehaviorTreeGraphNode_Decorator.h"
 #include "BehaviorTreeGraphNode_Service.h"
+#endif
 
 // Graph includes
 #include "EdGraph/EdGraph.h"
@@ -32,6 +34,14 @@
 
 // Reflection
 #include "UObject/UnrealType.h"
+
+#if ENGINE_MINOR_VERSION < 4
+TSharedPtr<FJsonObject> FUnrealMCPBTStructureCommands::HandleCommand(const FString& CommandType, const TSharedPtr<FJsonObject>& Params)
+{
+	return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("BT structure commands require UE 5.4+"));
+}
+void FUnrealMCPBTStructureCommands::RegisterCommands(FMCPCommandRegistry& Registry) {}
+#else
 
 //=============================================================================
 // Command Dispatch
@@ -1377,3 +1387,4 @@ void FUnrealMCPBTStructureCommands::RegisterCommands(FMCPCommandRegistry& Regist
 	Registry.RegisterCommand(TEXT("set_bt_node_property"),
 		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("set_bt_node_property"), P); });
 }
+#endif // ENGINE_MINOR_VERSION >= 4

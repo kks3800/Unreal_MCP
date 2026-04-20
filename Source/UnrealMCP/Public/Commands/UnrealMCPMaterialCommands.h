@@ -178,4 +178,7 @@ private:
 
 	/** Render and return a base64-encoded PNG thumbnail of a material. */
 	TSharedPtr<FJsonObject> HandleGetMaterialPreview(const TSharedPtr<FJsonObject>& Params);
+
+	/** Full material introspection — settings, nodes, connections, custom code, function calls. */
+	TSharedPtr<FJsonObject> HandleGetMaterialInfo(const TSharedPtr<FJsonObject>& Params);
 };

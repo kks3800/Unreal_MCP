@@ -13,10 +13,6 @@
 #include "Kismet/GameplayStatics.h"
 #include "Engine/StaticMeshActor.h"
 #include "Engine/StaticMesh.h"
-#include "Engine/DirectionalLight.h"
-#include "Engine/PointLight.h"
-#include "Engine/SpotLight.h"
-#include "Camera/CameraActor.h"
 #include "Components/StaticMeshComponent.h"
 #include "EditorSubsystem.h"
 #include "Subsystems/EditorActorSubsystem.h"
@@ -113,6 +109,10 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleCommand(const FString& C
     {
         return HandleGetActorMaterialInfo(Params);
     }
+    else if (CommandType == TEXT("set_actor_material"))
+    {
+        return HandleSetActorMaterial(Params);
+    }
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unknown editor command: %s"), *CommandType));
 }
@@ -163,115 +163,293 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleFindActorsByName(const T
     return ResultObj;
 }
 
+// Generic reflection-based property setter. Supports dot notation for component access
+// (e.g. "StaticMeshComponent0.CastShadow" or "SpotLightComponent0.InnerConeAngle").
+// Also handles special cases: asset path loading for UObject* properties.
+static bool SetReflectionProperty(UObject* Object, const FString& PropertyPath, const TSharedPtr<FJsonValue>& Value, FString& OutError)
+{
+    if (!Object)
+    {
+        OutError = TEXT("Null object");
+        return false;
+    }
+
+    // Dot notation: "ComponentName.Property" or "Component.Sub.Property"
+    FString FirstPart, Remainder;
+    if (PropertyPath.Split(TEXT("."), &FirstPart, &Remainder))
+    {
+        // Try component lookup first (actors only)
+        if (AActor* Actor = Cast<AActor>(Object))
+        {
+            for (UActorComponent* Comp : Actor->GetComponents())
+            {
+                if (Comp->GetName() == FirstPart || Comp->GetClass()->GetName() == FirstPart)
+                {
+                    return SetReflectionProperty(Comp, Remainder, Value, OutError);
+                }
+            }
+        }
+        // Try struct property on the object itself
+        FProperty* StructField = Object->GetClass()->FindPropertyByName(FName(*FirstPart));
+        if (FStructProperty* StructProp = CastField<FStructProperty>(StructField))
+        {
+            // Flatten the struct access into a direct property path on the struct memory
+            void* StructPtr = StructProp->ContainerPtrToValuePtr<void>(Object);
+            // Recurse: find sub-property (supports arbitrary nesting)
+            FString SubFirst, SubRest;
+            UScriptStruct* CurrentStruct = StructProp->Struct;
+            void* CurrentPtr = StructPtr;
+            FString CurrentPath = Remainder;
+            while (CurrentPath.Split(TEXT("."), &SubFirst, &SubRest))
+            {
+                FProperty* SubProp = CurrentStruct->FindPropertyByName(FName(*SubFirst));
+                FStructProperty* SubStruct = CastField<FStructProperty>(SubProp);
+                if (!SubStruct) { break; }
+                CurrentPtr = SubStruct->ContainerPtrToValuePtr<void>(CurrentPtr);
+                CurrentStruct = SubStruct->Struct;
+                CurrentPath = SubRest;
+            }
+            // CurrentPath is the final field name, CurrentStruct+CurrentPtr is the container
+            FProperty* FinalProp = CurrentStruct->FindPropertyByName(FName(*CurrentPath));
+            if (!FinalProp)
+            {
+                OutError = FString::Printf(TEXT("Field '%s' not found in struct %s"), *CurrentPath, *CurrentStruct->GetName());
+                return false;
+            }
+            void* FinalPtr = FinalProp->ContainerPtrToValuePtr<void>(CurrentPtr);
+            // Type dispatch (same set as below)
+            if (FBoolProperty* BP = CastField<FBoolProperty>(FinalProp)) { bool bV=false; if(Value->TryGetBool(bV)){BP->SetPropertyValue(FinalPtr,bV);}else{BP->SetPropertyValue(FinalPtr,Value->AsString().ToBool());} return true; }
+            if (FFloatProperty* FP = CastField<FFloatProperty>(FinalProp)) { double V=0; Value->TryGetNumber(V); FP->SetPropertyValue(FinalPtr,static_cast<float>(V)); return true; }
+            if (FDoubleProperty* DP = CastField<FDoubleProperty>(FinalProp)) { double V=0; Value->TryGetNumber(V); DP->SetPropertyValue(FinalPtr,V); return true; }
+            if (FIntProperty* IP = CastField<FIntProperty>(FinalProp)) { double V=0; Value->TryGetNumber(V); IP->SetPropertyValue(FinalPtr,static_cast<int32>(V)); return true; }
+            if (FByteProperty* YP = CastField<FByteProperty>(FinalProp)) { double V=0; Value->TryGetNumber(V); YP->SetPropertyValue(FinalPtr,static_cast<uint8>(V)); return true; }
+            if (FEnumProperty* EP = CastField<FEnumProperty>(FinalProp)) { FString S; double N; if(Value->TryGetString(S)){int64 E=EP->GetEnum()->GetValueByNameString(S);if(E!=INDEX_NONE){EP->GetUnderlyingProperty()->SetIntPropertyValue(FinalPtr,E);return true;}} if(Value->TryGetNumber(N)){EP->GetUnderlyingProperty()->SetIntPropertyValue(FinalPtr,static_cast<int64>(N));return true;} }
+            OutError = FString::Printf(TEXT("Unsupported type for struct field '%s'"), *CurrentPath);
+            return false;
+        }
+        if (Cast<AActor>(Object))
+        {
+            OutError = FString::Printf(TEXT("'%s' is not a component or struct on %s"), *FirstPart, *Object->GetName());
+            return false;
+        }
+    }
+
+    FProperty* Prop = Object->GetClass()->FindPropertyByName(FName(*PropertyPath));
+    if (!Prop)
+    {
+        OutError = FString::Printf(TEXT("Property '%s' not found on %s"), *PropertyPath, *Object->GetClass()->GetName());
+        return false;
+    }
+
+    void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Object);
+
+    if (FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop))
+    {
+        bool bVal = false;
+        if (Value->TryGetBool(bVal)) { BoolProp->SetPropertyValue(ValuePtr, bVal); return true; }
+        BoolProp->SetPropertyValue(ValuePtr, Value->AsString().ToBool()); return true;
+    }
+    if (FFloatProperty* FloatProp = CastField<FFloatProperty>(Prop))
+    {
+        double Val = 0; Value->TryGetNumber(Val);
+        FloatProp->SetPropertyValue(ValuePtr, static_cast<float>(Val)); return true;
+    }
+    if (FDoubleProperty* DoubleProp = CastField<FDoubleProperty>(Prop))
+    {
+        double Val = 0; Value->TryGetNumber(Val);
+        DoubleProp->SetPropertyValue(ValuePtr, Val); return true;
+    }
+    if (FIntProperty* IntProp = CastField<FIntProperty>(Prop))
+    {
+        double Val = 0; Value->TryGetNumber(Val);
+        IntProp->SetPropertyValue(ValuePtr, static_cast<int32>(Val)); return true;
+    }
+    if (FStrProperty* StrProp = CastField<FStrProperty>(Prop))
+    {
+        StrProp->SetPropertyValue(ValuePtr, Value->AsString()); return true;
+    }
+    if (FNameProperty* NameProp = CastField<FNameProperty>(Prop))
+    {
+        NameProp->SetPropertyValue(ValuePtr, FName(*Value->AsString())); return true;
+    }
+    if (FEnumProperty* EnumProp = CastField<FEnumProperty>(Prop))
+    {
+        FString StrVal; double NumVal;
+        if (Value->TryGetString(StrVal))
+        {
+            int64 EVal = EnumProp->GetEnum()->GetValueByNameString(StrVal);
+            if (EVal != INDEX_NONE) { EnumProp->GetUnderlyingProperty()->SetIntPropertyValue(ValuePtr, EVal); return true; }
+        }
+        if (Value->TryGetNumber(NumVal))
+        {
+            EnumProp->GetUnderlyingProperty()->SetIntPropertyValue(ValuePtr, static_cast<int64>(NumVal)); return true;
+        }
+    }
+    if (FByteProperty* ByteProp = CastField<FByteProperty>(Prop))
+    {
+        FString StrVal; double NumVal;
+        if (ByteProp->Enum && Value->TryGetString(StrVal))
+        {
+            int64 EVal = ByteProp->Enum->GetValueByNameString(StrVal);
+            if (EVal != INDEX_NONE) { ByteProp->SetPropertyValue(ValuePtr, static_cast<uint8>(EVal)); return true; }
+        }
+        if (Value->TryGetNumber(NumVal)) { ByteProp->SetPropertyValue(ValuePtr, static_cast<uint8>(NumVal)); return true; }
+    }
+    // UObject* properties — load by asset path string
+    if (FObjectProperty* ObjProp = CastField<FObjectProperty>(Prop))
+    {
+        FString AssetPath = Value->AsString();
+        UObject* Asset = LoadObject<UObject>(nullptr, *AssetPath);
+        if (!Asset)
+        {
+            FString WithDot = AssetPath + TEXT(".") + FPaths::GetCleanFilename(AssetPath);
+            Asset = LoadObject<UObject>(nullptr, *WithDot);
+        }
+        if (Asset)
+        {
+            ObjProp->SetObjectPropertyValue(ValuePtr, Asset);
+            return true;
+        }
+        OutError = FString::Printf(TEXT("Asset not found: %s"), *AssetPath);
+        return false;
+    }
+
+    OutError = FString::Printf(TEXT("Unsupported property type for '%s'"), *PropertyPath);
+    return false;
+}
+
+// Apply a "properties" JSON dict to an actor + its components via reflection
+static int32 ApplyPropertiesDict(AActor* Actor, const TSharedPtr<FJsonObject>& PropsObj, TArray<FString>& Errors)
+{
+    int32 Applied = 0;
+    for (const auto& Pair : PropsObj->Values)
+    {
+        FString Error;
+        if (SetReflectionProperty(Actor, Pair.Key, Pair.Value, Error))
+        {
+            ++Applied;
+        }
+        else
+        {
+            Errors.Add(Error);
+        }
+    }
+    return Applied;
+}
+
+// Resolve actor class from short name or full class path
+static UClass* ResolveActorClass(const FString& TypeStr)
+{
+    static TMap<FString, FString> ShortNames;
+    if (ShortNames.Num() == 0)
+    {
+        ShortNames.Add(TEXT("StaticMeshActor"),    TEXT("/Script/Engine.StaticMeshActor"));
+        ShortNames.Add(TEXT("PointLight"),          TEXT("/Script/Engine.PointLight"));
+        ShortNames.Add(TEXT("SpotLight"),           TEXT("/Script/Engine.SpotLight"));
+        ShortNames.Add(TEXT("DirectionalLight"),    TEXT("/Script/Engine.DirectionalLight"));
+        ShortNames.Add(TEXT("RectLight"),           TEXT("/Script/Engine.RectLight"));
+        ShortNames.Add(TEXT("CameraActor"),         TEXT("/Script/Engine.CameraActor"));
+        ShortNames.Add(TEXT("CineCameraActor"),     TEXT("/Script/CinematicCamera.CineCameraActor"));
+        ShortNames.Add(TEXT("ExponentialHeightFog"),TEXT("/Script/Engine.ExponentialHeightFog"));
+        ShortNames.Add(TEXT("SkyLight"),            TEXT("/Script/Engine.SkyLight"));
+        ShortNames.Add(TEXT("PostProcessVolume"),   TEXT("/Script/Engine.PostProcessVolume"));
+        ShortNames.Add(TEXT("SphereReflectionCapture"), TEXT("/Script/Engine.SphereReflectionCapture"));
+        ShortNames.Add(TEXT("BoxReflectionCapture"),TEXT("/Script/Engine.BoxReflectionCapture"));
+    }
+
+    // Case-insensitive short name lookup
+    for (const auto& Entry : ShortNames)
+    {
+        if (Entry.Key.Equals(TypeStr, ESearchCase::IgnoreCase))
+        {
+            return StaticLoadClass(AActor::StaticClass(), nullptr, *Entry.Value);
+        }
+    }
+
+    // Full class path (e.g. "/Script/Engine.APointLight" or "/Script/CinematicCamera.ACineCameraActor")
+    if (TypeStr.StartsWith(TEXT("/")))
+    {
+        return StaticLoadClass(AActor::StaticClass(), nullptr, *TypeStr);
+    }
+
+    // Try common patterns: /Script/Engine.A<Type> or /Script/Engine.<Type>
+    UClass* Found = StaticLoadClass(AActor::StaticClass(), nullptr, *FString::Printf(TEXT("/Script/Engine.A%s"), *TypeStr));
+    if (!Found)
+    {
+        Found = StaticLoadClass(AActor::StaticClass(), nullptr, *FString::Printf(TEXT("/Script/Engine.%s"), *TypeStr));
+    }
+    return Found;
+}
+
 TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleSpawnActor(const TSharedPtr<FJsonObject>& Params)
 {
-    // Get required parameters
     FString ActorType;
     if (!Params->TryGetStringField(TEXT("type"), ActorType))
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'type' parameter"));
     }
-
-    // Get actor name (required parameter)
     FString ActorName;
     if (!Params->TryGetStringField(TEXT("name"), ActorName))
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'name' parameter"));
     }
 
-    // Get optional transform parameters
     FVector Location(0.0f, 0.0f, 0.0f);
     FRotator Rotation(0.0f, 0.0f, 0.0f);
     FVector Scale(1.0f, 1.0f, 1.0f);
+    if (Params->HasField(TEXT("location"))) { Location = FUnrealMCPCommonUtils::GetVectorFromJson(Params, TEXT("location")); }
+    if (Params->HasField(TEXT("rotation"))) { Rotation = FUnrealMCPCommonUtils::GetRotatorFromJson(Params, TEXT("rotation")); }
+    if (Params->HasField(TEXT("scale")))    { Scale = FUnrealMCPCommonUtils::GetVectorFromJson(Params, TEXT("scale")); }
 
-    if (Params->HasField(TEXT("location")))
-    {
-        Location = FUnrealMCPCommonUtils::GetVectorFromJson(Params, TEXT("location"));
-    }
-    if (Params->HasField(TEXT("rotation")))
-    {
-        Rotation = FUnrealMCPCommonUtils::GetRotatorFromJson(Params, TEXT("rotation"));
-    }
-    if (Params->HasField(TEXT("scale")))
-    {
-        Scale = FUnrealMCPCommonUtils::GetVectorFromJson(Params, TEXT("scale"));
-    }
-
-    // Create the actor based on type
-    AActor* NewActor = nullptr;
     UWorld* World = GEditor->GetEditorWorldContext().World();
+    if (!World) { return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No editor world")); }
 
-    if (!World)
+    // Resolve actor class generically
+    UClass* ActorClass = ResolveActorClass(ActorType);
+    if (!ActorClass)
     {
-        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to get editor world"));
-    }
-
-    // Check if an actor with this name already exists
-    TArray<AActor*> AllActors;
-    UGameplayStatics::GetAllActorsOfClass(World, AActor::StaticClass(), AllActors);
-    for (AActor* Actor : AllActors)
-    {
-        if (Actor && Actor->GetName() == ActorName)
-        {
-            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Actor with name '%s' already exists"), *ActorName));
-        }
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Cannot resolve actor class: %s"), *ActorType));
     }
 
     FActorSpawnParameters SpawnParams;
     SpawnParams.Name = *ActorName;
+    SpawnParams.NameMode = FActorSpawnParameters::ESpawnActorNameMode::Required_ErrorAndReturnNull;
 
-    if (ActorType == TEXT("StaticMeshActor"))
+    AActor* NewActor = World->SpawnActor(ActorClass, &Location, &Rotation, SpawnParams);
+    if (!NewActor)
     {
-        NewActor = World->SpawnActor<AStaticMeshActor>(AStaticMeshActor::StaticClass(), Location, Rotation, SpawnParams);
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to spawn %s (name '%s' may already exist)"), *ActorType, *ActorName));
+    }
 
-        // Assign a static mesh — use explicit param or default to engine cube
-        if (AStaticMeshActor* SMActor = Cast<AStaticMeshActor>(NewActor))
+    // Apply scale
+    FTransform Transform = NewActor->GetTransform();
+    Transform.SetScale3D(Scale);
+    NewActor->SetActorTransform(Transform);
+
+    // Special case: StaticMeshActor — set mesh from "static_mesh" param
+    if (AStaticMeshActor* SMActor = Cast<AStaticMeshActor>(NewActor))
+    {
+        FString MeshPath;
+        if (!Params->TryGetStringField(TEXT("static_mesh"), MeshPath))
         {
-            FString MeshPath;
-            if (!Params->TryGetStringField(TEXT("static_mesh"), MeshPath))
-            {
-                MeshPath = TEXT("/Engine/BasicShapes/Cube.Cube");
-            }
-            UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, *MeshPath);
-            if (Mesh && SMActor->GetStaticMeshComponent())
-            {
-                SMActor->GetStaticMeshComponent()->SetStaticMesh(Mesh);
-            }
+            MeshPath = TEXT("/Engine/BasicShapes/Cube.Cube");
+        }
+        UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, *MeshPath);
+        if (Mesh && SMActor->GetStaticMeshComponent())
+        {
+            SMActor->GetStaticMeshComponent()->SetStaticMesh(Mesh);
         }
     }
-    else if (ActorType == TEXT("PointLight"))
+
+    // Apply "properties" dict via reflection (generic — works for ANY actor type)
+    const TSharedPtr<FJsonObject>* PropsObj = nullptr;
+    if (Params->TryGetObjectField(TEXT("properties"), PropsObj))
     {
-        NewActor = World->SpawnActor<APointLight>(APointLight::StaticClass(), Location, Rotation, SpawnParams);
-    }
-    else if (ActorType == TEXT("SpotLight"))
-    {
-        NewActor = World->SpawnActor<ASpotLight>(ASpotLight::StaticClass(), Location, Rotation, SpawnParams);
-    }
-    else if (ActorType == TEXT("DirectionalLight"))
-    {
-        NewActor = World->SpawnActor<ADirectionalLight>(ADirectionalLight::StaticClass(), Location, Rotation, SpawnParams);
-    }
-    else if (ActorType == TEXT("CameraActor"))
-    {
-        NewActor = World->SpawnActor<ACameraActor>(ACameraActor::StaticClass(), Location, Rotation, SpawnParams);
-    }
-    else
-    {
-        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unknown actor type: %s"), *ActorType));
+        TArray<FString> Errors;
+        ApplyPropertiesDict(NewActor, *PropsObj, Errors);
     }
 
-    if (NewActor)
-    {
-        // Set scale (since SpawnActor only takes location and rotation)
-        FTransform Transform = NewActor->GetTransform();
-        Transform.SetScale3D(Scale);
-        NewActor->SetActorTransform(Transform);
-
-        // Return the created actor's details
-        return FUnrealMCPCommonUtils::ActorToJsonObject(NewActor, true);
-    }
-
-    return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to create actor"));
+    return FUnrealMCPCommonUtils::ActorToJsonObject(NewActor, true);
 }
 
 TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleDeleteActor(const TSharedPtr<FJsonObject>& Params)
@@ -477,20 +655,24 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleGetActorMaterialInfo(con
     return FUnrealMCPCommonUtils::CreateSuccessResponse(Data);
 }
 
-TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleSetActorProperty(const TSharedPtr<FJsonObject>& Params)
+TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleSetActorMaterial(const TSharedPtr<FJsonObject>& Params)
 {
-    // Get actor name
     FString ActorName;
     if (!Params->TryGetStringField(TEXT("name"), ActorName))
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'name' parameter"));
     }
+    FString MaterialPath;
+    if (!Params->TryGetStringField(TEXT("material_path"), MaterialPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'material_path' parameter"));
+    }
+    int32 SlotIndex = 0;
+    Params->TryGetNumberField(TEXT("slot_index"), SlotIndex);
 
-    // Find the actor
     AActor* TargetActor = nullptr;
     TArray<AActor*> AllActors;
     UGameplayStatics::GetAllActorsOfClass(GWorld, AActor::StaticClass(), AllActors);
-    
     for (AActor* Actor : AllActors)
     {
         if (Actor && Actor->GetName() == ActorName)
@@ -499,32 +681,85 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleSetActorProperty(const T
             break;
         }
     }
-
     if (!TargetActor)
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Actor not found: %s"), *ActorName));
     }
 
-    // Get property name
+    UMaterialInterface* NewMaterial = LoadObject<UMaterialInterface>(nullptr, *MaterialPath);
+    if (!NewMaterial)
+    {
+        FString WithDot = MaterialPath + TEXT(".") + FPaths::GetCleanFilename(MaterialPath);
+        NewMaterial = LoadObject<UMaterialInterface>(nullptr, *WithDot);
+    }
+    if (!NewMaterial)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Material not found: %s"), *MaterialPath));
+    }
+
+    TArray<UPrimitiveComponent*> Components;
+    TargetActor->GetComponents<UPrimitiveComponent>(Components);
+    int32 Applied = 0;
+    for (UPrimitiveComponent* Comp : Components)
+    {
+        if (SlotIndex < Comp->GetNumMaterials())
+        {
+            Comp->SetMaterial(SlotIndex, NewMaterial);
+            ++Applied;
+        }
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), Applied > 0);
+    ResultObj->SetStringField(TEXT("actor"), ActorName);
+    ResultObj->SetStringField(TEXT("material"), MaterialPath);
+    ResultObj->SetNumberField(TEXT("components_updated"), Applied);
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleSetActorProperty(const TSharedPtr<FJsonObject>& Params)
+{
+    FString ActorName;
+    if (!Params->TryGetStringField(TEXT("name"), ActorName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'name' parameter"));
+    }
+
+    AActor* TargetActor = nullptr;
+    TArray<AActor*> AllActors;
+    UGameplayStatics::GetAllActorsOfClass(GWorld, AActor::StaticClass(), AllActors);
+    for (AActor* Actor : AllActors)
+    {
+        if (Actor && Actor->GetName() == ActorName) { TargetActor = Actor; break; }
+    }
+    if (!TargetActor)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Actor not found: %s"), *ActorName));
+    }
+
+    // Mode 1: single property via "property_name" + "property_value"
     FString PropertyName;
-    if (!Params->TryGetStringField(TEXT("property_name"), PropertyName))
+    if (Params->TryGetStringField(TEXT("property_name"), PropertyName))
     {
-        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'property_name' parameter"));
-    }
+        if (!Params->HasField(TEXT("property_value")))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'property_value' parameter"));
+        }
+        TSharedPtr<FJsonValue> PropertyValue = Params->Values.FindRef(TEXT("property_value"));
 
-    // Get property value
-    if (!Params->HasField(TEXT("property_value")))
-    {
-        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'property_value' parameter"));
-    }
-    
-    TSharedPtr<FJsonValue> PropertyValue = Params->Values.FindRef(TEXT("property_value"));
+        if (PropertyName == TEXT("FolderPath"))
+        {
+            TargetActor->SetFolderPath(FName(*PropertyValue->AsString()));
+        }
+        else
+        {
+            FString Error;
+            if (!SetReflectionProperty(TargetActor, PropertyName, PropertyValue, Error))
+            {
+                return FUnrealMCPCommonUtils::CreateErrorResponse(Error);
+            }
+        }
 
-    // Special case: FolderPath is an FName and must be set via SetFolderPath
-    if (PropertyName == TEXT("FolderPath"))
-    {
-        FString FolderValue = PropertyValue->AsString();
-        TargetActor->SetFolderPath(FName(*FolderValue));
         TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
         ResultObj->SetStringField(TEXT("actor"), ActorName);
         ResultObj->SetStringField(TEXT("property"), PropertyName);
@@ -532,24 +767,26 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleSetActorProperty(const T
         return ResultObj;
     }
 
-    // Set the property using our utility function
-    FString ErrorMessage;
-    if (FUnrealMCPCommonUtils::SetObjectProperty(TargetActor, PropertyName, PropertyValue, ErrorMessage))
+    // Mode 2: batch properties via "properties" dict
+    const TSharedPtr<FJsonObject>* PropsObj = nullptr;
+    if (Params->TryGetObjectField(TEXT("properties"), PropsObj))
     {
-        // Property set successfully
+        TArray<FString> Errors;
+        int32 Applied = ApplyPropertiesDict(TargetActor, *PropsObj, Errors);
+
         TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
-        ResultObj->SetStringField(TEXT("actor"), ActorName);
-        ResultObj->SetStringField(TEXT("property"), PropertyName);
-        ResultObj->SetBoolField(TEXT("success"), true);
-        
-        // Also include the full actor details
-        ResultObj->SetObjectField(TEXT("actor_details"), FUnrealMCPCommonUtils::ActorToJsonObject(TargetActor, true));
+        ResultObj->SetBoolField(TEXT("success"), Applied > 0);
+        ResultObj->SetNumberField(TEXT("properties_set"), Applied);
+        if (Errors.Num() > 0)
+        {
+            TArray<TSharedPtr<FJsonValue>> ErrArr;
+            for (const FString& E : Errors) { ErrArr.Add(MakeShared<FJsonValueString>(E)); }
+            ResultObj->SetArrayField(TEXT("errors"), ErrArr);
+        }
         return ResultObj;
     }
-    else
-    {
-        return FUnrealMCPCommonUtils::CreateErrorResponse(ErrorMessage);
-    }
+
+    return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Provide 'property_name'+'property_value' or 'properties' dict"));
 }
 
 TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleSpawnBlueprintActor(const TSharedPtr<FJsonObject>& Params)
@@ -619,6 +856,7 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleSpawnBlueprintActor(cons
 
     FActorSpawnParameters SpawnParams;
     SpawnParams.Name = *ActorName;
+    SpawnParams.NameMode = FActorSpawnParameters::ESpawnActorNameMode::Required_ErrorAndReturnNull;
 
     AActor* NewActor = World->SpawnActor<AActor>(Blueprint->GeneratedClass, SpawnTransform, SpawnParams);
     if (NewActor)
@@ -1029,4 +1267,6 @@ void FUnrealMCPEditorCommands::RegisterCommands(FMCPCommandRegistry& Registry)
 		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("set_cvar"), P); });
 	Registry.RegisterCommand(TEXT("get_actor_material_info"),
 		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("get_actor_material_info"), P); });
+	Registry.RegisterCommand(TEXT("set_actor_material"),
+		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("set_actor_material"), P); });
 }

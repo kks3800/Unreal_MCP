@@ -20,6 +20,7 @@
 #include "Commands/UnrealMCPBlueprintInspectCommands.h"
 #include "Commands/UnrealMCPBlueprintSearchCommands.h"
 #include "Commands/UnrealMCPBlueprintGraphCommands.h"
+#include "Commands/UnrealMCPBlueprintMultigraphCommands.h"
 #include "Commands/UnrealMCPBTAssetCommands.h"
 #include "Commands/UnrealMCPBTNodeCommands.h"
 #include "Commands/UnrealMCPBTStructureCommands.h"
@@ -85,6 +86,7 @@ private:
 	TSharedPtr<FUnrealMCPBlueprintInspectCommands> BlueprintInspectCommands;
 	TSharedPtr<FUnrealMCPBlueprintSearchCommands> BlueprintSearchCommands;
 	TSharedPtr<FUnrealMCPBlueprintGraphCommands> BlueprintGraphCommands;
+	TSharedPtr<FUnrealMCPBlueprintMultigraphCommands> BlueprintMultigraphCommands;
 	TSharedPtr<FUnrealMCPBTAssetCommands> BTAssetCommands;
 	TSharedPtr<FUnrealMCPBTNodeCommands> BTNodeCommands;
 	TSharedPtr<FUnrealMCPBTStructureCommands> BTStructureCommands;

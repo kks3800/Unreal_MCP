@@ -1610,6 +1610,7 @@ static void EnsureWidgetGuids(UWidgetBlueprint* WidgetBlueprint)
 			return;
 		}
 		const FName WidgetFName = Widget->GetFName();
+#if ENGINE_MINOR_VERSION >= 5
 		if (!WidgetBlueprint->WidgetVariableNameToGuidMap.Contains(WidgetFName))
 		{
 			// Make the widget a BP variable so downstream BP graph code can
@@ -1617,6 +1618,13 @@ static void EnsureWidgetGuids(UWidgetBlueprint* WidgetBlueprint)
 			Widget->bIsVariable = true;
 			WidgetBlueprint->WidgetVariableNameToGuidMap.Add(WidgetFName, FGuid::NewGuid());
 		}
+#else
+		// UE 5.3 does not have WidgetVariableNameToGuidMap — just mark as variable.
+		if (!Widget->bIsVariable)
+		{
+			Widget->bIsVariable = true;
+		}
+#endif
 	});
 }
 

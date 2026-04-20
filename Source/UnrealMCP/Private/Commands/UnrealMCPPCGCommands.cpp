@@ -556,6 +556,8 @@ TSharedPtr<FJsonObject> FUnrealMCPPCGCommands::HandleGetPCGNodeSchema(const TSha
 	// gives the default layout a freshly-created node would have.
 	UPCGSettings* Transient = NewObject<UPCGSettings>(GetTransientPackage(), SettingsClass);
 
+
+#if ENGINE_MINOR_VERSION >= 5
 	auto PinStatusToString = [](EPCGPinStatus Status) -> FString
 	{
 		switch (Status)
@@ -582,14 +584,30 @@ TSharedPtr<FJsonObject> FUnrealMCPPCGCommands::HandleGetPCGNodeSchema(const TSha
 		}
 		return Out;
 	};
+#else
+	auto BuildPinArray = [](const TArray<FPCGPinProperties>& Pins) -> TArray<TSharedPtr<FJsonValue>>
+	{
+		TArray<TSharedPtr<FJsonValue>> Out;
+		for (const FPCGPinProperties& Pin : Pins)
+		{
+			TSharedPtr<FJsonObject> PinEntry = MakeShared<FJsonObject>();
+			PinEntry->SetStringField(TEXT("label"), Pin.Label.ToString());
+			PinEntry->SetNumberField(TEXT("allowed_types"), static_cast<int64>(Pin.AllowedTypes));
+			Out.Add(MakeShared<FJsonValueObject>(PinEntry));
+		}
+		return Out;
+	};
+#endif
 
 	TSharedPtr<FJsonObject> PinsObject = MakeShared<FJsonObject>();
+#if ENGINE_MINOR_VERSION >= 5
 	if (Transient)
 	{
 		PinsObject->SetArrayField(TEXT("input"), BuildPinArray(Transient->InputPinProperties()));
 		PinsObject->SetArrayField(TEXT("output"), BuildPinArray(Transient->OutputPinProperties()));
 	}
 	else
+#endif
 	{
 		PinsObject->SetArrayField(TEXT("input"), TArray<TSharedPtr<FJsonValue>>());
 		PinsObject->SetArrayField(TEXT("output"), TArray<TSharedPtr<FJsonValue>>());
@@ -1396,7 +1414,11 @@ TSharedPtr<FJsonObject> FUnrealMCPPCGCommands::HandleConnectPCGNodes(const TShar
 			}
 			// Prefer an unconnected pin but fall back to any multi-connection pin
 			// if the only outputs are already wired — common on fan-out patterns.
+#if ENGINE_MINOR_VERSION >= 5
 			if (!Candidate->IsConnected() || Candidate->AllowsMultipleConnections())
+#else
+			if (!Candidate->IsConnected())
+#endif
 			{
 				FromPin = Candidate;
 				FromPinLabel = Candidate->Properties.Label.ToString();
@@ -1435,7 +1457,12 @@ TSharedPtr<FJsonObject> FUnrealMCPPCGCommands::HandleConnectPCGNodes(const TShar
 			{
 				continue;
 			}
+
+#if ENGINE_MINOR_VERSION >= 5
 			if (Candidate->IsConnected() && !Candidate->AllowsMultipleConnections())
+#else
+			if (Candidate->IsConnected())
+#endif
 			{
 				continue;
 			}
@@ -1806,8 +1833,14 @@ namespace
 		}
 
 		PinJson->SetStringField(TEXT("label"), Pin->Properties.Label.ToString());
+#if ENGINE_MINOR_VERSION >= 5
 		PinJson->SetStringField(TEXT("allowed_types"), Pin->Properties.AllowedTypes.ToString());
+#else
+		PinJson->SetNumberField(TEXT("allowed_types"), static_cast<int64>(Pin->Properties.AllowedTypes));
+#endif
+#if ENGINE_MINOR_VERSION >= 5
 		PinJson->SetBoolField(TEXT("allow_multiple"), Pin->AllowsMultipleConnections());
+#endif
 		PinJson->SetBoolField(TEXT("is_connected"), Pin->IsConnected());
 
 		TArray<TSharedPtr<FJsonValue>> EdgeArray;

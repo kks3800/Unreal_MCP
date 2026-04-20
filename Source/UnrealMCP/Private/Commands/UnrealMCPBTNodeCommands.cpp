@@ -50,7 +50,8 @@
 #include "BehaviorTree/Services/BTService_DefaultFocus.h"
 #include "BehaviorTree/Services/BTService_RunEQS.h"
 
-// Editor graph node includes
+// Editor graph node includes (not available/exported before 5.4)
+#if ENGINE_MINOR_VERSION >= 4
 #include "BehaviorTreeGraph.h"
 #include "BehaviorTreeGraphNode.h"
 #include "BehaviorTreeGraphNode_Composite.h"
@@ -59,6 +60,7 @@
 #include "BehaviorTreeGraphNode_Service.h"
 #include "BehaviorTreeGraphNode_Root.h"
 #include "AIGraphTypes.h"
+#endif
 
 // EQS includes for RunEQS task/service
 #include "EnvironmentQuery/EnvQuery.h"
@@ -331,6 +333,17 @@ namespace BTNodeHelpers
 		return false;
 	}
 }
+
+// BT graph node classes (UBehaviorTreeGraphNode_Task etc.) are not DLL-exported before 5.4
+#if ENGINE_MINOR_VERSION < 4
+
+TSharedPtr<FJsonObject> FUnrealMCPBTNodeCommands::HandleCommand(const FString& CommandType, const TSharedPtr<FJsonObject>& Params)
+{
+	return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Behavior Tree node commands require UE 5.4+"));
+}
+void FUnrealMCPBTNodeCommands::RegisterCommands(FMCPCommandRegistry& Registry) {}
+
+#else // ENGINE_MINOR_VERSION >= 4
 
 //=============================================================================
 // Command Dispatch
@@ -3131,3 +3144,5 @@ void FUnrealMCPBTNodeCommands::RegisterCommands(FMCPCommandRegistry& Registry)
 	Registry.RegisterCommand(TEXT("add_bt_service_run_eqs"),
 		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("add_bt_service_run_eqs"), P); });
 }
+
+#endif // ENGINE_MINOR_VERSION >= 4

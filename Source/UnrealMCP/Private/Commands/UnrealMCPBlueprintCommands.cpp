@@ -24,6 +24,8 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "GameFramework/Actor.h"
 #include "GameFramework/Pawn.h"
+// Phase 10: transactional batch execution so a single undo reverts the whole build
+#include "ScopedTransaction.h"
 
 FUnrealMCPBlueprintCommands::FUnrealMCPBlueprintCommands()
 {
@@ -1490,6 +1492,18 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleExecuteBlueprintBatch
             FString::Printf(TEXT("Failed to begin batch edit for %s"), *BlueprintName));
     }
 
+    // Phase 10: Wrap the whole batch in a single editor transaction so one
+    // Ctrl+Z reverts the entire build, not node-by-node. FScopedTransaction's
+    // destructor closes the transaction automatically — even if we early-out
+    // or an op throws. Marking the Blueprint dirty here ensures structural
+    // changes made inside op handlers are captured by the transaction.
+    FScopedTransaction BatchTransaction(
+        NSLOCTEXT("UnrealMCP", "BuildBlueprintGraph", "UnrealMCP Build Blueprint Graph"));
+    if (UBlueprint* ActiveBP = FUnrealMCPCommonUtils::FindBlueprint(BlueprintName))
+    {
+        ActiveBP->Modify();
+    }
+
     TArray<TSharedPtr<FJsonValue>> Results;
     int32 SuccessCount = 0;
     int32 FailCount = 0;
@@ -1578,6 +1592,13 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleExecuteBlueprintBatch
 
     // End batch edit (single compile + optional save + optional layout)
     FMCPBlueprintContext::Get().EndEdit(bAutoCompile, bAutoSave, AutoLayoutGraph);
+
+    // Phase 10: If nothing actually mutated the graph, roll back the empty
+    // transaction so the editor's undo history isn't polluted with a no-op.
+    if (SuccessCount == 0 && FailCount == 0)
+    {
+        BatchTransaction.Cancel();
+    }
 
     Response->SetBoolField(TEXT("success"), FailCount == 0);
     Response->SetNumberField(TEXT("success_count"), SuccessCount);

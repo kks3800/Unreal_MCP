@@ -761,6 +761,37 @@ def register_material_tools(mcp: FastMCP):
             logger.error(f"Error getting material hierarchy: {e}")
             return {"status": "error", "error": str(e)}
 
+    @mcp.tool()
+    def get_material_info(
+        ctx: Context,
+        material_name: str
+    ) -> Dict[str, Any]:
+        """Full material introspection — returns EVERYTHING about a material or function.
+
+        Dumps: material settings (domain, blend mode, shading model, flags),
+        all nodes with type-specific data (parameters, custom HLSL code, textures,
+        function calls, component masks, constants), all node-to-node connections,
+        material output wiring (BaseColor, Normal, etc.), comment boxes,
+        and function boundary info (inputs/outputs) for material functions.
+
+        Use this to learn from existing materials and recreate similar ones.
+
+        Args:
+            material_name: Material or function name/path (e.g. /Game/Materials/M_MyMat)
+        """
+        from unreal_mcp_server import get_unreal_connection
+
+        try:
+            unreal = get_unreal_connection()
+            if not unreal:
+                return {"success": False, "error": "Not connected to Unreal Engine"}
+            return unreal.send_command("get_material_info", {
+                "material_name": material_name
+            })
+        except Exception as e:
+            logger.error(f"Error getting material info: {e}")
+            return {"success": False, "error": str(e)}
+
     # =========================================================================
     # Material Function Tools
     # =========================================================================

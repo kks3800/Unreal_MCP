@@ -305,6 +305,7 @@ from tools.asset_tools import register_asset_tools
 from tools.blueprint_inspect_tools import register_blueprint_inspect_tools
 from tools.blueprint_search_tools import register_blueprint_search_tools
 from tools.blueprint_graph_tools import register_blueprint_graph_tools
+from tools.blueprint_multigraph_tools import register_blueprint_multigraph_tools
 from tools.blueprint_compound_tools import register_blueprint_compound_tools
 from tools.blueprint_intelligence import register_blueprint_intelligence_tools
 from tools.behavior_tree_tools import register_behavior_tree_tools
@@ -337,6 +338,7 @@ MODULE_REGISTRY = {
     "blueprint_inspect":     register_blueprint_inspect_tools,
     "blueprint_search":      register_blueprint_search_tools,
     "blueprint_graph":       register_blueprint_graph_tools,
+    "blueprint_multigraph":  register_blueprint_multigraph_tools,
     "blueprint_compound":    register_blueprint_compound_tools,
     "blueprint_intelligence": register_blueprint_intelligence_tools,
     "behavior_tree":         register_behavior_tree_tools,

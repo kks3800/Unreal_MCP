@@ -81,35 +81,108 @@ def register_editor_tools(mcp: FastMCP):
         name: str,
         type: str,
         location: List[float] = [0.0, 0.0, 0.0],
-        rotation: List[float] = [0.0, 0.0, 0.0]
+        rotation: List[float] = [0.0, 0.0, 0.0],
+        static_mesh: str = None,
+        intensity: float = None,
+        color: List[float] = None,
+        temperature: float = None,
+        attenuation_radius: float = None,
+        source_radius: float = None,
+        soft_source_radius: float = None,
+        cast_shadows: bool = None,
+        inner_cone_angle: float = None,
+        outer_cone_angle: float = None,
+        source_width: float = None,
+        source_height: float = None,
+        barn_door_angle: float = None,
+        barn_door_length: float = None,
+        scale: List[float] = None
     ) -> Dict[str, Any]:
         """Create a new actor in the current level.
-        
+
         Args:
             ctx: The MCP context
             name: The name to give the new actor (must be unique)
-            type: The type of actor to create (e.g. StaticMeshActor, PointLight)
+            type: The type of actor to create (e.g. StaticMeshActor, PointLight, SpotLight, RectLight, DirectionalLight, CameraActor)
             location: The [x, y, z] world location to spawn at
             rotation: The [pitch, yaw, roll] rotation in degrees
-            
+            static_mesh: Asset path for StaticMeshActor (default: /Engine/BasicShapes/Cube.Cube)
+            intensity: Light intensity in candelas
+            color: Light color as [r, g, b] (0-1 range)
+            temperature: Color temperature in Kelvin (enables temperature mode)
+            attenuation_radius: Light falloff radius
+            source_radius: Soft shadow source radius (Point/SpotLight)
+            soft_source_radius: Additional soft shadow radius (Point/SpotLight)
+            cast_shadows: Whether the light casts shadows
+            inner_cone_angle: SpotLight inner cone angle in degrees
+            outer_cone_angle: SpotLight outer cone angle in degrees
+            source_width: RectLight width in cm
+            source_height: RectLight height in cm
+            barn_door_angle: RectLight barn door angle
+            barn_door_length: RectLight barn door length
+            scale: Actor scale as [x, y, z]
+
         Returns:
             Dict containing the created actor's properties
         """
         from unreal_mcp_server import get_unreal_connection
-        
+
         try:
             unreal = get_unreal_connection()
             if not unreal:
                 logger.error("Failed to connect to Unreal Engine")
                 return {"success": False, "message": "Failed to connect to Unreal Engine"}
-            
+
+            # Normalize common type aliases
+            type_map = {
+                "STATICMESHACTOR": "StaticMeshActor",
+                "POINTLIGHT": "PointLight",
+                "SPOTLIGHT": "SpotLight",
+                "RECTLIGHT": "RectLight",
+                "DIRECTIONALLIGHT": "DirectionalLight",
+                "CAMERAACTOR": "CameraActor",
+            }
+            actor_type = type_map.get(type.upper(), type)
+
             # Ensure all parameters are properly formatted
             params = {
                 "name": name,
-                "type": type.upper(),  # Make sure type is uppercase
+                "type": actor_type,
                 "location": location,
                 "rotation": rotation
             }
+
+            # Forward optional params
+            if static_mesh is not None:
+                params["static_mesh"] = static_mesh
+            if intensity is not None:
+                params["intensity"] = intensity
+            if color is not None:
+                params["color"] = color
+            if temperature is not None:
+                params["temperature"] = temperature
+            if attenuation_radius is not None:
+                params["attenuation_radius"] = attenuation_radius
+            if source_radius is not None:
+                params["source_radius"] = source_radius
+            if soft_source_radius is not None:
+                params["soft_source_radius"] = soft_source_radius
+            if cast_shadows is not None:
+                params["cast_shadows"] = cast_shadows
+            if inner_cone_angle is not None:
+                params["inner_cone_angle"] = inner_cone_angle
+            if outer_cone_angle is not None:
+                params["outer_cone_angle"] = outer_cone_angle
+            if source_width is not None:
+                params["source_width"] = source_width
+            if source_height is not None:
+                params["source_height"] = source_height
+            if barn_door_angle is not None:
+                params["barn_door_angle"] = barn_door_angle
+            if barn_door_length is not None:
+                params["barn_door_length"] = barn_door_length
+            if scale is not None:
+                params["scale"] = scale
             
             # Validate location and rotation formats
             for param_name in ["location", "rotation"]:
@@ -447,5 +520,29 @@ def register_editor_tools(mcp: FastMCP):
         if not unreal:
             return {"success": False, "error": "Not connected to Unreal Engine"}
         return unreal.send_command("get_actor_material_info", {"name": name})
+
+    @mcp.tool()
+    def set_actor_material(
+        ctx: Context,
+        name: str,
+        material_path: str,
+        slot_index: int = 0
+    ) -> Dict[str, Any]:
+        """Assign a material to an actor's mesh component.
+
+        Args:
+            name: The actor name in the level.
+            material_path: Asset path of the material (e.g. /Game/Materials/M_MyMat).
+            slot_index: Material slot index (default 0).
+        """
+        from unreal_mcp_server import get_unreal_connection
+        unreal = get_unreal_connection()
+        if not unreal:
+            return {"success": False, "error": "Not connected to Unreal Engine"}
+        return unreal.send_command("set_actor_material", {
+            "name": name,
+            "material_path": material_path,
+            "slot_index": slot_index
+        })
 
     logger.info("Editor tools registered successfully")

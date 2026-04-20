@@ -2007,4 +2007,144 @@ def register_blueprint_node_tools(mcp: FastMCP):
         except Exception as e:
             return {"success": False, "message": f"Error: {e}"}
 
+    # =========================================================================
+    # Rework Phases 5-7: pin introspection + dynamic cast + component bound event
+    # =========================================================================
+
+    @mcp.tool()
+    def describe_node_pins(
+        ctx: Context,
+        node_class: str,
+        struct_type: str = "",
+        enum_type: str = "",
+        target_class: str = "",
+        is_pure: bool = False,
+    ) -> Dict[str, Any]:
+        """Return the default pin layout for a K2 node class WITHOUT spawning it.
+
+        Use this before wiring to learn exact pin names, types, and directions.
+        The node is instantiated in a transient graph and discarded — no blueprint
+        is modified.
+
+        Args:
+            node_class: Short name like "Branch", "MakeArray", "Switch on Int",
+                        "Dynamic Cast", "MakeStruct", "Self", "ComponentBoundEvent",
+                        or the raw UClass name like "K2Node_IfThenElse".
+            struct_type: For MakeStruct / BreakStruct — the struct to preview
+                         (e.g. "FVector", "MyCustomStruct", "/Script/Engine.HitResult").
+            enum_type: For SwitchOnEnum — the enum to preview (e.g. "EInputEvent").
+            target_class: For DynamicCast — the class to cast to.
+            is_pure: For DynamicCast — preview the pure variant (no exec pins).
+
+        Returns:
+            Dict with fields:
+                node_class: resolved UClass short name
+                resolved_name: editor display title
+                pins: list of pin dicts (name, direction, category, sub_category,
+                      sub_category_object, container_type, is_reference, is_const,
+                      hidden, default_value, ...)
+        """
+        from unreal_mcp_server import get_unreal_connection
+        try:
+            params: Dict[str, Any] = {"node_class": node_class}
+            if struct_type:
+                params["struct_type"] = struct_type
+            if enum_type:
+                params["enum_type"] = enum_type
+            if target_class:
+                params["target_class"] = target_class
+            if is_pure:
+                params["is_pure"] = is_pure
+            unreal = get_unreal_connection()
+            if not unreal:
+                return {"success": False, "message": "Failed to connect to Unreal Engine"}
+            return unreal.send_command("describe_node_pins", params) or {"success": False, "message": "No response"}
+        except Exception as e:
+            return {"success": False, "message": f"Error: {e}"}
+
+    @mcp.tool()
+    def add_dynamic_cast_node(
+        ctx: Context,
+        blueprint_name: str,
+        target_class: str,
+        is_pure: bool = False,
+        position: list = None,
+        graph_name: str = "",
+    ) -> Dict[str, Any]:
+        """Spawn a Dynamic Cast (aka Cast To <Class>) node with explicit purity.
+
+        Unlike add_cast_node, this variant honors the is_pure flag so the caller
+        can request the pure (no exec pins) form up front.
+
+        Args:
+            blueprint_name: Target Blueprint name.
+            target_class: Class to cast to (e.g. "Character", "/Script/Engine.PlayerController").
+            is_pure: True = pure cast (output recomputed on read, no exec pins).
+            position: Optional [X, Y] position.
+            graph_name: Optional graph name (defaults to EventGraph).
+
+        Returns:
+            Node info dict including node_id and pins.
+        """
+        from unreal_mcp_server import get_unreal_connection
+        try:
+            if position is None:
+                position = [0, 0]
+            params = {
+                "blueprint_name": blueprint_name,
+                "target_class": target_class,
+                "is_pure": is_pure,
+                "position": position,
+                "graph_name": graph_name,
+            }
+            unreal = get_unreal_connection()
+            if not unreal:
+                return {"success": False, "message": "Failed to connect to Unreal Engine"}
+            return unreal.send_command("add_dynamic_cast_node", params) or {"success": False, "message": "No response"}
+        except Exception as e:
+            return {"success": False, "message": f"Error: {e}"}
+
+    @mcp.tool()
+    def add_component_bound_event_node(
+        ctx: Context,
+        blueprint_name: str,
+        component_name: str,
+        delegate_name: str,
+        position: list = None,
+        graph_name: str = "",
+    ) -> Dict[str, Any]:
+        """Spawn a Component-Bound Event node (auto-binds to a component's multicast delegate).
+
+        This is how you get the green "OnClicked" / "OnBeginOverlap" event nodes that
+        come pre-wired to a specific component instance in the blueprint.
+
+        Args:
+            blueprint_name: Target Blueprint name.
+            component_name: Name of the component UPROPERTY (e.g. "Mesh", "Trigger").
+            delegate_name: Name of the multicast delegate on that component class
+                           (e.g. "OnComponentBeginOverlap", "OnClicked").
+            position: Optional [X, Y] position.
+            graph_name: Optional graph name (defaults to EventGraph).
+
+        Returns:
+            Node info dict including node_id and pins.
+        """
+        from unreal_mcp_server import get_unreal_connection
+        try:
+            if position is None:
+                position = [0, 0]
+            params = {
+                "blueprint_name": blueprint_name,
+                "component_name": component_name,
+                "delegate_name": delegate_name,
+                "position": position,
+                "graph_name": graph_name,
+            }
+            unreal = get_unreal_connection()
+            if not unreal:
+                return {"success": False, "message": "Failed to connect to Unreal Engine"}
+            return unreal.send_command("add_component_bound_event_node", params) or {"success": False, "message": "No response"}
+        except Exception as e:
+            return {"success": False, "message": f"Error: {e}"}
+
     logger.info("Blueprint node tools registered successfully")

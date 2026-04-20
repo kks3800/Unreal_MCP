@@ -730,6 +730,22 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintInspectCommands::HandleGetBlueprintSn
 		return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'blueprint_name' parameter"));
 	}
 
+	// Phase 9: Tiered blueprint snapshot. "minimal" = name+parent+compile+counts, "standard"
+	// = variable/component/graph names only (no default values, no exposure flags),
+	// "full" = everything. Default "full" for backward compatibility.
+	FString DetailLevel = TEXT("full");
+	Params->TryGetStringField(TEXT("detail_level"), DetailLevel);
+	DetailLevel = DetailLevel.ToLower();
+
+	FString DetailWarning;
+	if (DetailLevel != TEXT("minimal") && DetailLevel != TEXT("standard") && DetailLevel != TEXT("full"))
+	{
+		DetailWarning = FString::Printf(
+			TEXT("Unknown detail_level '%s'; falling back to 'full'. Valid values: minimal, standard, full."),
+			*DetailLevel);
+		DetailLevel = TEXT("full");
+	}
+
 	UBlueprint* Blueprint = FUnrealMCPCommonUtils::FindBlueprint(BlueprintName);
 	if (!Blueprint)
 	{
@@ -740,6 +756,11 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintInspectCommands::HandleGetBlueprintSn
 	TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
 
 	Data->SetStringField(TEXT("name"), Blueprint->GetName());
+	Data->SetStringField(TEXT("detail_level"), DetailLevel);
+	if (!DetailWarning.IsEmpty())
+	{
+		Data->SetStringField(TEXT("detail_level_warning"), DetailWarning);
+	}
 
 	// Parent class
 	if (Blueprint->ParentClass)
@@ -759,7 +780,35 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintInspectCommands::HandleGetBlueprintSn
 	}
 	Data->SetStringField(TEXT("compile_status"), StatusStr);
 
-	// Variables
+	// Minimal: emit only counts, skip full variable/component/graph lists.
+	if (DetailLevel == TEXT("minimal"))
+	{
+		Data->SetNumberField(TEXT("variable_count"), Blueprint->NewVariables.Num());
+
+		int32 ComponentCount = 0;
+		if (Blueprint->SimpleConstructionScript)
+		{
+			for (USCS_Node* SCSNode : Blueprint->SimpleConstructionScript->GetAllNodes())
+			{
+				if (SCSNode && SCSNode->ComponentTemplate)
+				{
+					++ComponentCount;
+				}
+			}
+		}
+		Data->SetNumberField(TEXT("component_count"), ComponentCount);
+
+		const int32 GraphCount = Blueprint->UbergraphPages.Num()
+			+ Blueprint->FunctionGraphs.Num()
+			+ Blueprint->MacroGraphs.Num();
+		Data->SetNumberField(TEXT("graph_count"), GraphCount);
+
+		return FUnrealMCPCommonUtils::CreateSuccessResponse(Data);
+	}
+
+	const bool bFull = (DetailLevel == TEXT("full"));
+
+	// Variables — standard emits name+type only; full adds exposure/default/category.
 	TArray<TSharedPtr<FJsonValue>> VariablesArray;
 	for (const FBPVariableDescription& Var : Blueprint->NewVariables)
 	{
@@ -767,17 +816,20 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintInspectCommands::HandleGetBlueprintSn
 		VarObj->SetStringField(TEXT("name"), Var.VarName.ToString());
 		VarObj->SetStringField(TEXT("type"), Var.VarType.PinCategory.ToString());
 
-		bool bIsExposed = (Var.PropertyFlags & CPF_ExposeOnSpawn) != 0
-			|| (Var.PropertyFlags & CPF_BlueprintVisible) != 0;
-		VarObj->SetBoolField(TEXT("is_exposed"), bIsExposed);
-		VarObj->SetStringField(TEXT("default_value"), Var.DefaultValue);
-		VarObj->SetStringField(TEXT("category"), Var.Category.ToString());
+		if (bFull)
+		{
+			const bool bIsExposed = (Var.PropertyFlags & CPF_ExposeOnSpawn) != 0
+				|| (Var.PropertyFlags & CPF_BlueprintVisible) != 0;
+			VarObj->SetBoolField(TEXT("is_exposed"), bIsExposed);
+			VarObj->SetStringField(TEXT("default_value"), Var.DefaultValue);
+			VarObj->SetStringField(TEXT("category"), Var.Category.ToString());
+		}
 
 		VariablesArray.Add(MakeShared<FJsonValueObject>(VarObj));
 	}
 	Data->SetArrayField(TEXT("variables"), VariablesArray);
 
-	// Components
+	// Components — standard emits name+class; full adds parent.
 	TArray<TSharedPtr<FJsonValue>> ComponentsArray;
 	if (Blueprint->SimpleConstructionScript)
 	{
@@ -793,47 +845,53 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintInspectCommands::HandleGetBlueprintSn
 			CompObj->SetStringField(TEXT("name"), SCSNode->GetVariableName().ToString());
 			CompObj->SetStringField(TEXT("class"), SCSNode->ComponentTemplate->GetClass()->GetName());
 
-			// Find parent name
-			FString ParentName = TEXT("None");
-			if (SCSNode->ParentComponentOrVariableName != NAME_None)
+			if (bFull)
 			{
-				ParentName = SCSNode->ParentComponentOrVariableName.ToString();
+				FString ParentName = TEXT("None");
+				if (SCSNode->ParentComponentOrVariableName != NAME_None)
+				{
+					ParentName = SCSNode->ParentComponentOrVariableName.ToString();
+				}
+				CompObj->SetStringField(TEXT("parent"), ParentName);
 			}
-			CompObj->SetStringField(TEXT("parent"), ParentName);
 
 			ComponentsArray.Add(MakeShared<FJsonValueObject>(CompObj));
 		}
 	}
 	Data->SetArrayField(TEXT("components"), ComponentsArray);
 
-	// Graphs
+	// Graphs — standard emits name+type only; full adds node_count.
 	TArray<TSharedPtr<FJsonValue>> GraphsArray;
 
-	for (UEdGraph* Graph : Blueprint->UbergraphPages)
+	struct FGraphCategory
 	{
-		TSharedPtr<FJsonObject> GraphObj = MakeShared<FJsonObject>();
-		GraphObj->SetStringField(TEXT("name"), Graph->GetName());
-		GraphObj->SetNumberField(TEXT("node_count"), Graph->Nodes.Num());
-		GraphObj->SetStringField(TEXT("type"), TEXT("event_graph"));
-		GraphsArray.Add(MakeShared<FJsonValueObject>(GraphObj));
-	}
+		const TArray<TObjectPtr<UEdGraph>>* Graphs;
+		const TCHAR* TypeStr;
+	};
 
-	for (UEdGraph* Graph : Blueprint->FunctionGraphs)
-	{
-		TSharedPtr<FJsonObject> GraphObj = MakeShared<FJsonObject>();
-		GraphObj->SetStringField(TEXT("name"), Graph->GetName());
-		GraphObj->SetNumberField(TEXT("node_count"), Graph->Nodes.Num());
-		GraphObj->SetStringField(TEXT("type"), TEXT("function"));
-		GraphsArray.Add(MakeShared<FJsonValueObject>(GraphObj));
-	}
+	const FGraphCategory Categories[] = {
+		{ &Blueprint->UbergraphPages, TEXT("event_graph") },
+		{ &Blueprint->FunctionGraphs, TEXT("function") },
+		{ &Blueprint->MacroGraphs,    TEXT("macro") }
+	};
 
-	for (UEdGraph* Graph : Blueprint->MacroGraphs)
+	for (const FGraphCategory& Cat : Categories)
 	{
-		TSharedPtr<FJsonObject> GraphObj = MakeShared<FJsonObject>();
-		GraphObj->SetStringField(TEXT("name"), Graph->GetName());
-		GraphObj->SetNumberField(TEXT("node_count"), Graph->Nodes.Num());
-		GraphObj->SetStringField(TEXT("type"), TEXT("macro"));
-		GraphsArray.Add(MakeShared<FJsonValueObject>(GraphObj));
+		for (UEdGraph* Graph : *Cat.Graphs)
+		{
+			if (!Graph)
+			{
+				continue;
+			}
+			TSharedPtr<FJsonObject> GraphObj = MakeShared<FJsonObject>();
+			GraphObj->SetStringField(TEXT("name"), Graph->GetName());
+			GraphObj->SetStringField(TEXT("type"), Cat.TypeStr);
+			if (bFull)
+			{
+				GraphObj->SetNumberField(TEXT("node_count"), Graph->Nodes.Num());
+			}
+			GraphsArray.Add(MakeShared<FJsonValueObject>(GraphObj));
+		}
 	}
 
 	Data->SetArrayField(TEXT("graphs"), GraphsArray);
@@ -857,6 +915,23 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintInspectCommands::HandleGetGraphSnapsh
 	FString GraphName = TEXT("EventGraph");
 	Params->TryGetStringField(TEXT("graph_name"), GraphName);
 
+	// Phase 9: Tiered graph snapshot — detail_level controls per-node output size.
+	// "minimal" = identity only (~50 tok/node), "standard" = identity+pin names/directions
+	// (~150 tok/node), "full" = everything (~400 tok/node). Default is "full" to preserve
+	// existing callers (blueprint_intelligence depends on connected_to + pin types).
+	FString DetailLevel = TEXT("full");
+	Params->TryGetStringField(TEXT("detail_level"), DetailLevel);
+	DetailLevel = DetailLevel.ToLower();
+
+	FString DetailWarning;
+	if (DetailLevel != TEXT("minimal") && DetailLevel != TEXT("standard") && DetailLevel != TEXT("full"))
+	{
+		DetailWarning = FString::Printf(
+			TEXT("Unknown detail_level '%s'; falling back to 'full'. Valid values: minimal, standard, full."),
+			*DetailLevel);
+		DetailLevel = TEXT("full");
+	}
+
 	UBlueprint* Blueprint = FUnrealMCPCommonUtils::FindBlueprint(BlueprintName);
 	if (!Blueprint)
 	{
@@ -874,6 +949,14 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintInspectCommands::HandleGetGraphSnapsh
 	TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
 	Data->SetStringField(TEXT("graph_name"), Graph->GetName());
 	Data->SetNumberField(TEXT("node_count"), Graph->Nodes.Num());
+	Data->SetStringField(TEXT("detail_level"), DetailLevel);
+	if (!DetailWarning.IsEmpty())
+	{
+		Data->SetStringField(TEXT("detail_level_warning"), DetailWarning);
+	}
+
+	const bool bIncludePins = (DetailLevel != TEXT("minimal"));
+	const bool bFullPins = (DetailLevel == TEXT("full"));
 
 	TArray<TSharedPtr<FJsonValue>> NodesArray;
 
@@ -888,44 +971,97 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintInspectCommands::HandleGetGraphSnapsh
 		NodeObj->SetStringField(TEXT("guid"), Node->NodeGuid.ToString());
 		NodeObj->SetStringField(TEXT("title"), Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
 		NodeObj->SetStringField(TEXT("class"), Node->GetClass()->GetName());
-		NodeObj->SetNumberField(TEXT("pos_x"), Node->NodePosX);
-		NodeObj->SetNumberField(TEXT("pos_y"), Node->NodePosY);
 
-		// Pins with inline connection data
-		TArray<TSharedPtr<FJsonValue>> PinsArray;
-
-		for (UEdGraphPin* Pin : Node->Pins)
+		// Authoritative member/function reference data — kept compact enough to
+		// include at every detail level. Enables builder-side idempotency dedup
+		// without the fragile title-strip heuristic.
+		if (UK2Node_CallFunction* FuncNode = Cast<UK2Node_CallFunction>(Node))
 		{
-			if (!Pin || Pin->bHidden)
+			const FMemberReference& FnRef = FuncNode->FunctionReference;
+			NodeObj->SetStringField(TEXT("member_name"), FnRef.GetMemberName().ToString());
+			if (UClass* MemberParent = FnRef.GetMemberParentClass())
 			{
-				continue;
+				NodeObj->SetStringField(TEXT("member_parent"), MemberParent->GetName());
 			}
-
-			TSharedPtr<FJsonObject> PinObj = MakeShared<FJsonObject>();
-			PinObj->SetStringField(TEXT("name"), Pin->PinName.ToString());
-			PinObj->SetStringField(TEXT("direction"), Pin->Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
-			PinObj->SetStringField(TEXT("type"), Pin->PinType.PinCategory.ToString());
-
-			// Inline connection data: "NodeGUID:PinName" for each linked pin
-			TArray<TSharedPtr<FJsonValue>> ConnectedToArray;
-			for (UEdGraphPin* LinkedPin : Pin->LinkedTo)
+			NodeObj->SetBoolField(TEXT("is_self_context"), FnRef.IsSelfContext());
+		}
+		else if (UK2Node_VariableGet* VarGet = Cast<UK2Node_VariableGet>(Node))
+		{
+			const FMemberReference& VarRef = VarGet->VariableReference;
+			NodeObj->SetStringField(TEXT("member_name"), VarRef.GetMemberName().ToString());
+			if (UClass* MemberParent = VarRef.GetMemberParentClass())
 			{
-				if (!LinkedPin || !LinkedPin->GetOwningNode())
+				NodeObj->SetStringField(TEXT("member_parent"), MemberParent->GetName());
+			}
+			NodeObj->SetBoolField(TEXT("is_self_context"), VarRef.IsSelfContext());
+		}
+		else if (UK2Node_VariableSet* VarSet = Cast<UK2Node_VariableSet>(Node))
+		{
+			const FMemberReference& VarRef = VarSet->VariableReference;
+			NodeObj->SetStringField(TEXT("member_name"), VarRef.GetMemberName().ToString());
+			if (UClass* MemberParent = VarRef.GetMemberParentClass())
+			{
+				NodeObj->SetStringField(TEXT("member_parent"), MemberParent->GetName());
+			}
+			NodeObj->SetBoolField(TEXT("is_self_context"), VarRef.IsSelfContext());
+		}
+		else if (UK2Node_Event* EventNode = Cast<UK2Node_Event>(Node))
+		{
+			// The EventReference carries the real event function name (e.g.
+			// ReceiveTick); the node's display title strips the "Receive" prefix.
+			NodeObj->SetStringField(TEXT("member_name"), EventNode->EventReference.GetMemberName().ToString());
+			if (!EventNode->CustomFunctionName.IsNone())
+			{
+				NodeObj->SetStringField(TEXT("custom_function_name"), EventNode->CustomFunctionName.ToString());
+			}
+		}
+
+		if (bIncludePins)
+		{
+			NodeObj->SetNumberField(TEXT("pos_x"), Node->NodePosX);
+			NodeObj->SetNumberField(TEXT("pos_y"), Node->NodePosY);
+
+			TArray<TSharedPtr<FJsonValue>> PinsArray;
+
+			for (UEdGraphPin* Pin : Node->Pins)
+			{
+				if (!Pin || Pin->bHidden)
 				{
 					continue;
 				}
 
-				FString ConnectionStr = FString::Printf(TEXT("%s:%s"),
-					*LinkedPin->GetOwningNode()->NodeGuid.ToString(),
-					*LinkedPin->PinName.ToString());
-				ConnectedToArray.Add(MakeShared<FJsonValueString>(ConnectionStr));
-			}
-			PinObj->SetArrayField(TEXT("connected_to"), ConnectedToArray);
+				TSharedPtr<FJsonObject> PinObj = MakeShared<FJsonObject>();
+				PinObj->SetStringField(TEXT("name"), Pin->PinName.ToString());
+				PinObj->SetStringField(TEXT("direction"),
+					Pin->Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
 
-			PinsArray.Add(MakeShared<FJsonValueObject>(PinObj));
+				if (bFullPins)
+				{
+					PinObj->SetStringField(TEXT("type"), Pin->PinType.PinCategory.ToString());
+
+					// Inline connection data: "NodeGUID:PinName" for each linked pin
+					TArray<TSharedPtr<FJsonValue>> ConnectedToArray;
+					for (UEdGraphPin* LinkedPin : Pin->LinkedTo)
+					{
+						if (!LinkedPin || !LinkedPin->GetOwningNode())
+						{
+							continue;
+						}
+
+						FString ConnectionStr = FString::Printf(TEXT("%s:%s"),
+							*LinkedPin->GetOwningNode()->NodeGuid.ToString(),
+							*LinkedPin->PinName.ToString());
+						ConnectedToArray.Add(MakeShared<FJsonValueString>(ConnectionStr));
+					}
+					PinObj->SetArrayField(TEXT("connected_to"), ConnectedToArray);
+				}
+
+				PinsArray.Add(MakeShared<FJsonValueObject>(PinObj));
+			}
+
+			NodeObj->SetArrayField(TEXT("pins"), PinsArray);
 		}
 
-		NodeObj->SetArrayField(TEXT("pins"), PinsArray);
 		NodesArray.Add(MakeShared<FJsonValueObject>(NodeObj));
 	}
 

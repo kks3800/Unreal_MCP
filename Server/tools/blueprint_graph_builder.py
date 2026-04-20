@@ -42,6 +42,12 @@ DIRECT_NODE_COMMANDS: Dict[str, str] = {
     "SwitchOnInt": "add_switch_on_int_node",
     "SwitchOnString": "add_switch_on_string_node",
     "SwitchOnEnum": "add_switch_on_enum_node",
+    # Aliases so builders can use the shorter name matching the C++ short-name table
+    "SwitchInt": "add_switch_on_int_node",
+    "SwitchString": "add_switch_on_string_node",
+    "SwitchEnum": "add_switch_on_enum_node",
+    "MakeStruct": "add_make_struct_node",
+    "BreakStruct": "add_break_struct_node",
     "MakeArray": "add_make_array_node",
     "MakeMap": "add_make_map_node",
     "MakeSet": "add_make_set_node",
@@ -52,6 +58,12 @@ DIRECT_NODE_COMMANDS: Dict[str, str] = {
     "FormatText": "add_format_text_node",
     "Select": "add_select_node",
     "Timeline": "add_timeline_node",
+    # Phases 5-7 additions
+    "DynamicCast": "add_dynamic_cast_node",
+    "CastTo": "add_dynamic_cast_node",
+    "SelfRef": "add_blueprint_self_reference",
+    "Self": "add_blueprint_self_reference",
+    "ComponentBoundEvent": "add_component_bound_event_node",
 }
 
 
@@ -64,7 +76,7 @@ class BPNode:
 
     __slots__ = (
         "name", "node_type", "props", "column", "row", "x", "y",
-        "is_exec", "op_index",
+        "is_exec", "op_index", "existing_guid",
     )
 
     def __init__(self, name: str, node_type: str, props: Optional[Dict[str, Any]] = None):
@@ -77,6 +89,9 @@ class BPNode:
         self.y: int = 0
         self.is_exec: bool = False   # True if node has exec pins
         self.op_index: int = -1      # Index in the generated op list
+        # Phase 10 idempotency: if set, this node already exists in the graph
+        # and we reuse its guid instead of emitting an add_* op.
+        self.existing_guid: Optional[str] = None
 
 
 class BPConnection:
@@ -127,6 +142,9 @@ class BlueprintGraphBuilder:
         # Data-flow adjacency
         self._data_adj: Dict[str, List[str]] = defaultdict(list)
 
+        # Phase 10 idempotency: count of nodes reused from existing graph
+        self.reused_count: int = 0
+
     def reset(self) -> None:
         self.nodes.clear()
         self.connections.clear()
@@ -134,6 +152,7 @@ class BlueprintGraphBuilder:
         self._exec_adj.clear()
         self._exec_reverse.clear()
         self._data_adj.clear()
+        self.reused_count = 0
 
     # ------------------------------------------------------------------
     # SPEC LOADING
@@ -300,6 +319,187 @@ class BlueprintGraphBuilder:
                 node.y = int(pos[1])
 
     # ------------------------------------------------------------------
+    # IDEMPOTENCY (Phase 10)
+    # ------------------------------------------------------------------
+
+    def _node_signature(self, node: BPNode) -> Optional[Tuple[str, ...]]:
+        """
+        Compute a dedup signature for a spec node, or None to skip dedup.
+
+        Only certain node types have well-defined identity:
+          - Event nodes: event entry is a singleton per event name per graph
+          - VariableGet / VariableSet: dedupe on variable name
+          - Function: dedupe on (target, function_name)
+          - SearchAction / MacroInstance: dedupe on resolved search keyword
+
+        Nodes without a signature (Branch, Sequence, etc.) are never deduped —
+        users legitimately spawn multiples.
+        """
+        t = node.node_type
+        if t == "Event":
+            return ("Event", str(node.props.get("event_name", "")).lower())
+        if t == "CustomEvent":
+            return ("CustomEvent", str(node.props.get("event_name", "")).lower())
+        if t == "VariableGet":
+            return ("VariableGet", str(node.props.get("variable_name", "")))
+        if t == "VariableSet":
+            return ("VariableSet", str(node.props.get("variable_name", "")))
+        if t == "Function":
+            return (
+                "Function",
+                str(node.props.get("target", "self")),
+                str(node.props.get("function_name", "")),
+            )
+        if t in ("SearchAction", "MacroInstance"):
+            kw = str(node.props.get("search", "")).lower()
+            if not kw:
+                return None
+            return ("Search", kw, str(node.props.get("class_filter", "")))
+        if t == "ComponentRef":
+            return ("ComponentRef", str(node.props.get("component_name", "")))
+        return None
+
+    @staticmethod
+    def _snapshot_node_signature(
+        snap_node: Dict[str, Any]
+    ) -> List[Tuple[str, ...]]:
+        """
+        Derive candidate signatures from a snapshot node so we can match against
+        spec signatures.
+
+        Snapshot shape (from C++ HandleGetGraphSnapshot): each node has
+            { guid, title, class, pos_x, pos_y, pins: [...] }
+
+        The class name and title carry the type identity for our purposes:
+            - K2Node_Event: title like "Event BeginPlay" → event name = last word
+            - K2Node_CustomEvent: title is the event name
+            - K2Node_VariableGet: title is the variable name
+            - K2Node_VariableSet: title is "SET" or "Set <Var>" — use pin hint
+            - K2Node_CallFunction: title is the function display name
+
+        We return a LIST of signatures because a single snapshot node can match
+        multiple spec flavors (e.g. a function call may match "Function" or
+        "SearchAction" with the same keyword).
+        """
+        node_class = str(snap_node.get("class", ""))
+        title = str(snap_node.get("title", ""))
+        title_lower = title.lower().strip()
+        # Phase 10b: authoritative member reference added by the C++ snapshot
+        # handler. When present it's reliable; fall back to title-strip for
+        # older snapshots that don't have these fields.
+        member_name = str(snap_node.get("member_name", "")).strip()
+        member_parent = str(snap_node.get("member_parent", "")).strip()
+        custom_fn_name = str(snap_node.get("custom_function_name", "")).strip()
+        sigs: List[Tuple[str, ...]] = []
+
+        if node_class == "K2Node_Event":
+            # Prefer the authoritative event reference member name (e.g.
+            # "ReceiveTick"); fall back to stripping the title.
+            event_name = member_name or title
+            if not member_name and title_lower.startswith("event "):
+                event_name = title[len("event "):].strip()
+            event_lower = event_name.lower()
+            sigs.append(("Event", event_lower))
+            # Some events carry the "Receive" prefix in the API but drop it in
+            # UI — emit both to be robust.
+            if event_lower.startswith("receive"):
+                sigs.append(("Event", event_lower[len("receive"):]))
+            else:
+                sigs.append(("Event", "receive" + event_lower))
+        elif node_class == "K2Node_CustomEvent":
+            # Custom events carry their name in CustomFunctionName.
+            name = custom_fn_name or member_name or title
+            sigs.append(("CustomEvent", name.lower()))
+        elif node_class == "K2Node_VariableGet":
+            var_name = member_name if member_name else title
+            if not member_name and title_lower.startswith("get "):
+                var_name = title[len("get "):].strip()
+            sigs.append(("VariableGet", var_name))
+        elif node_class == "K2Node_VariableSet":
+            var_name = member_name if member_name else title
+            if not member_name and title_lower.startswith("set "):
+                var_name = title[len("set "):].strip()
+            sigs.append(("VariableSet", var_name))
+        elif node_class == "K2Node_CallFunction":
+            # When the C++ snapshot provides member_name + member_parent, the
+            # spec-side ("Function", target, function_name) signature can match
+            # exactly. Emit every plausible form the target could take.
+            if member_name:
+                if member_parent:
+                    sigs.append(("Function", member_parent, member_name))
+                    # Also try common short-name / U-prefix variants to match
+                    # how specs often write the target (e.g. "KismetMathLibrary"
+                    # instead of "UKismetMathLibrary"). FindCallableFunction on
+                    # the C++ side strips "U"; we replicate here.
+                    if member_parent.startswith("U"):
+                        sigs.append(("Function", member_parent[1:], member_name))
+                # Empty/self target fallback
+                sigs.append(("Function", "self", member_name))
+                sigs.append(("Function", "", member_name))
+                # Search fallback (title-keyed)
+                sigs.append(("Search", member_name.lower(), ""))
+            # Legacy fallback when member fields absent — use title.
+            else:
+                sigs.append(("Search", title_lower, ""))
+                sigs.append(("Function", "self", title))
+        elif node_class == "K2Node_SpawnActorFromClass":
+            sigs.append(("Search", "spawn actor", ""))
+        return sigs
+
+    def apply_graph_snapshot(self, snapshot: Optional[Dict[str, Any]]) -> None:
+        """
+        Cross-reference the spec against an existing graph snapshot to set
+        `existing_guid` on nodes we want to reuse.
+
+        `snapshot` is the dict returned by `get_graph_snapshot` — either the
+        raw response, or the already-unwrapped `result` field. We handle both.
+        Pass None to skip dedup.
+        """
+        if not snapshot:
+            return
+
+        # Unwrap nested layers. The raw get_graph_snapshot response shape is
+        #   {status, result: {success, data: {graph_name, node_count, nodes: [...]}}}
+        # Peel both "result" and "data" so callers can hand us the raw response
+        # or any already-partially-unwrapped variant.
+        for key in ("result", "data"):
+            if (
+                isinstance(snapshot, dict)
+                and key in snapshot
+                and isinstance(snapshot[key], dict)
+                and "nodes" not in snapshot
+            ):
+                snapshot = snapshot[key]
+
+        snap_nodes = snapshot.get("nodes") if isinstance(snapshot, dict) else None
+        if not isinstance(snap_nodes, list):
+            return
+
+        # Build signature → guid map from snapshot (first-match wins)
+        sig_to_guid: Dict[Tuple[str, ...], str] = {}
+        for snap in snap_nodes:
+            if not isinstance(snap, dict):
+                continue
+            guid = snap.get("guid")
+            if not guid:
+                continue
+            for sig in self._snapshot_node_signature(snap):
+                sig_to_guid.setdefault(sig, str(guid))
+
+        # Match spec nodes against the signature map
+        for name, node in self.nodes.items():
+            sig = self._node_signature(node)
+            if sig is None:
+                continue
+            existing = sig_to_guid.get(sig)
+            if existing:
+                node.existing_guid = existing
+                self.reused_count += 1
+                logger.info(
+                    f"Reusing existing node for '{name}' ({node.node_type}) → {existing}"
+                )
+
+    # ------------------------------------------------------------------
     # OP GENERATION
     # ------------------------------------------------------------------
 
@@ -308,40 +508,56 @@ class BlueprintGraphBuilder:
         Generate execute_blueprint_batch operations.
 
         Returns a list of operation dicts ready for execute_blueprint_batch.
-        Node references use $N.node_id syntax.
+        Node references use $N.node_id syntax for newly-spawned nodes, or the
+        literal guid string for reused nodes (Phase 10 idempotency).
         """
         self.compute_layout()
 
         ops: List[Dict[str, Any]] = []
-        name_to_op_index: Dict[str, int] = {}
+        # name -> reference string used for op payloads.
+        # For spawned nodes: "$<op_index>.node_id"
+        # For reused nodes: the literal guid (no $ prefix; resolver passes it through)
+        name_to_ref: Dict[str, str] = {}
 
-        # Phase 1: Create all nodes
+        # Phase 1: Create all nodes (skip spawn for reused)
         for name, node in self.nodes.items():
+            if node.existing_guid:
+                # Already in the graph — no add_* op, just record the guid
+                name_to_ref[name] = node.existing_guid
+                continue
+
             op = self._node_to_op(name, node)
             if op:
                 node.op_index = len(ops)
-                name_to_op_index[name] = len(ops)
+                name_to_ref[name] = f"${len(ops)}.node_id"
                 ops.append(op)
 
-        # Phase 2: Set pin default values
+        # Phase 2: Set pin default values.
+        # BUGFIX (Phase 10): The C++ handler expects "node_guid" and "value".
+        # Previous code sent "node_id" and "default_value" — both wrong, hence
+        # the "Missing 'node_guid' parameter" error.
         for name, defaults in self.pin_defaults.items():
-            if name not in name_to_op_index:
+            ref = name_to_ref.get(name)
+            if not ref:
+                logger.warning(
+                    f"Skipping pin_defaults for '{name}': node has no spawned/"
+                    f"reused ref (was it filtered out of the spec?)"
+                )
                 continue
-            idx = name_to_op_index[name]
             for pin_name, value in defaults.items():
                 ops.append({
                     "op": "set_pin_default_value",
-                    "node_id": f"${idx}.node_id",
+                    "node_guid": ref,            # <-- was "node_id" (wrong key)
                     "pin_name": pin_name,
-                    "default_value": str(value),
+                    "value": str(value),         # <-- was "default_value"
                     "graph_name": self.graph_name,
                 })
 
         # Phase 3: Connect nodes
         for conn in self.connections:
-            from_idx = name_to_op_index.get(conn.from_node)
-            to_idx = name_to_op_index.get(conn.to_node)
-            if from_idx is None or to_idx is None:
+            from_ref = name_to_ref.get(conn.from_node)
+            to_ref = name_to_ref.get(conn.to_node)
+            if from_ref is None or to_ref is None:
                 logger.warning(
                     f"Skipping connection {conn.from_node}.{conn.from_pin} -> "
                     f"{conn.to_node}.{conn.to_pin}: node not found"
@@ -350,9 +566,9 @@ class BlueprintGraphBuilder:
 
             ops.append({
                 "op": "connect_blueprint_nodes",
-                "source_node_id": f"${from_idx}.node_id",
+                "source_node_id": from_ref,
                 "source_pin": conn.from_pin,
-                "target_node_id": f"${to_idx}.node_id",
+                "target_node_id": to_ref,
                 "target_pin": conn.to_pin,
                 "graph_name": self.graph_name,
             })
@@ -383,7 +599,7 @@ class BlueprintGraphBuilder:
                 "op": "add_blueprint_function_node",
                 "target": node.props.get("target", "self"),
                 "function_name": node.props["function_name"],
-                "node_position": f"[{position[0]},{position[1]}]",
+                "node_position": position,
             }
             if "params" in node.props:
                 op["params"] = node.props["params"]
@@ -410,7 +626,7 @@ class BlueprintGraphBuilder:
             return {
                 "op": "add_blueprint_event_node",
                 "event_name": node.props["event_name"],
-                "node_position": f"[{position[0]},{position[1]}]",
+                "node_position": position,
             }
         if node_type == "CustomEvent":
             return {
@@ -425,14 +641,14 @@ class BlueprintGraphBuilder:
             return {
                 "op": "add_blueprint_get_self_component_reference",
                 "component_name": node.props["component_name"],
-                "node_position": f"[{position[0]},{position[1]}]",
+                "node_position": position,
             }
 
         # Self reference
         if node_type == "SelfRef":
             return {
                 "op": "add_blueprint_self_reference",
-                "node_position": f"[{position[0]},{position[1]}]",
+                "node_position": position,
             }
 
         # Cast node

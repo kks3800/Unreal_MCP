@@ -25,9 +25,19 @@
 #include "BehaviorTree/Blackboard/BlackboardKeyType_Rotator.h"
 #include "BehaviorTree/BTCompositeNode.h"
 
-// Editor factories
+// Editor factories (not exported before 5.4)
+#if ENGINE_MINOR_VERSION >= 4
 #include "BehaviorTreeFactory.h"
 #include "BlackboardDataFactory.h"
+#endif
+
+#if ENGINE_MINOR_VERSION < 4
+TSharedPtr<FJsonObject> FUnrealMCPBTAssetCommands::HandleCommand(const FString& CommandType, const TSharedPtr<FJsonObject>& Params)
+{
+	return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("BT asset commands require UE 5.4+"));
+}
+void FUnrealMCPBTAssetCommands::RegisterCommands(FMCPCommandRegistry& Registry) {}
+#else
 
 //=============================================================================
 // Command Dispatch
@@ -1008,3 +1018,4 @@ void FUnrealMCPBTAssetCommands::RegisterCommands(FMCPCommandRegistry& Registry)
 	Registry.RegisterCommand(TEXT("modify_blackboard_key"),
 		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("modify_blackboard_key"), P); });
 }
+#endif // ENGINE_MINOR_VERSION >= 4

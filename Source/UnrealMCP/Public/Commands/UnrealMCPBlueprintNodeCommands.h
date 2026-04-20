@@ -85,6 +85,11 @@ private:
     TSharedPtr<FJsonObject> HandleAddSelectNode(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleAddInterfaceMessageNode(const TSharedPtr<FJsonObject>& Params);
 
+    // Rework (Phases 5-7): introspection + richer structural nodes
+    TSharedPtr<FJsonObject> HandleDescribeNodePins(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleAddDynamicCastNode(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleAddComponentBoundEventNode(const TSharedPtr<FJsonObject>& Params);
+
     // Helpers
     UEdGraphNode* CreateMacroInstanceNode(UEdGraph* Graph, const FString& MacroName, const FVector2D& Position);
 };

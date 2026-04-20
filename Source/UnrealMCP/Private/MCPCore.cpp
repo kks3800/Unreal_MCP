@@ -326,7 +326,12 @@ bool FMCPPCGContext::EndEdit(bool bAutoLayout, bool bSave)
 
 #if WITH_EDITOR
 	Graph->EnableNotificationsForEditor();
+
+#if ENGINE_MINOR_VERSION >= 5
 	Graph->ForceNotificationForEditor(EPCGChangeType::Structural);
+#else
+	Graph->ForceNotificationForEditor();
+#endif
 
 	// Ensure the package is marked dirty after all mutations in this session.
 	// The initial MarkPackageDirty() at graph-creation time may have been cleared
@@ -380,7 +385,12 @@ bool FMCPPCGContext::IsEditingGraph(const FString& GraphPath) const
 	int32 DotIndex = INDEX_NONE;
 	if (Normalized.FindChar(TEXT('.'), DotIndex))
 	{
+
+#if ENGINE_MINOR_VERSION >= 7
 		Normalized.LeftInline(DotIndex, EAllowShrinking::No);
+#else
+		Normalized.LeftInline(DotIndex, false);
+#endif
 	}
 	return Normalized == ActiveGraphPath;
 }

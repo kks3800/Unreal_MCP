@@ -9,6 +9,7 @@
 #include "EdGraphSchema_K2.h"
 #include "BlueprintNodeSpawner.h"
 #include "BlueprintActionDatabase.h"
+#include "BlueprintActionFilter.h"
 #include "BlueprintFunctionNodeSpawner.h"
 #include "BlueprintNodeBinder.h" // IBlueprintNodeBinder::FBindingSet
 #include "Kismet2/BlueprintEditorUtils.h"
@@ -54,11 +55,85 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintSearchCommands::HandleCommand(
 
 //=============================================================================
 // HandleSearchBlueprintActions
+//
+// Phase 3: context-filtered action search. When `blueprint_name` is supplied,
+// we build a canonical FBlueprintActionContext + FBlueprintActionFilter around
+// that blueprint's skeleton class + event graph, and let the Kismet action
+// filter reject cross-blueprint actions (same mechanism the editor's action
+// menu uses). Results are then scored against the query and sorted by score
+// before pagination.
+//
+// Scoring (simple, deterministic):
+//   +10 if MenuName contains the full query substring (case-insensitive)
+//   +3  if Tooltip contains the full query substring
+//   +1  per whitespace-delimited query token that appears in Keywords
+// Actions with Score <= 0 are dropped.
+//
+// When `blueprint_name` is empty / missing the filter step is skipped and the
+// scoring loop still runs — keeps the tool usable for global discovery.
 //=============================================================================
+
+namespace UnrealMCPSearchInternal
+{
+	/** Compute match score for a given action's ui spec vs the query. */
+	static int32 ComputeScore(
+		const FString& MenuName,
+		const FString& Tooltip,
+		const FString& Keywords,
+		const FString& Query,
+		const TArray<FString>& QueryTokens)
+	{
+		int32 Score = 0;
+		if (!Query.IsEmpty())
+		{
+			if (MenuName.Contains(Query, ESearchCase::IgnoreCase))
+			{
+				Score += 10;
+			}
+			if (Tooltip.Contains(Query, ESearchCase::IgnoreCase))
+			{
+				Score += 3;
+			}
+		}
+		for (const FString& Token : QueryTokens)
+		{
+			if (Token.IsEmpty())
+			{
+				continue;
+			}
+			if (Keywords.Contains(Token, ESearchCase::IgnoreCase))
+			{
+				Score += 1;
+			}
+			// Small bonus: token hit in MenuName when the full-string check failed.
+			// Helps multi-word queries like "Get Counter" match "Get Counter Value"
+			// consistently even if display punctuation differs.
+			else if (MenuName.Contains(Token, ESearchCase::IgnoreCase))
+			{
+				Score += 1;
+			}
+		}
+		return Score;
+	}
+
+	/** Record tying a candidate to its origin key + original spawner index. */
+	struct FScoredCandidate
+	{
+		int32 Score = 0;
+		FObjectKey OwnerKey;
+		int32 SpawnerIndex = 0;
+		UBlueprintNodeSpawner const* Spawner = nullptr;
+		FString MenuName;
+		FString Category;
+		FString Keywords;
+	};
+}
 
 TSharedPtr<FJsonObject> FUnrealMCPBlueprintSearchCommands::HandleSearchBlueprintActions(
 	const TSharedPtr<FJsonObject>& Params)
 {
+	using namespace UnrealMCPSearchInternal;
+
 	FString Keyword;
 	if (!Params->TryGetStringField(TEXT("keyword"), Keyword))
 	{
@@ -80,16 +155,85 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintSearchCommands::HandleSearchBlueprint
 	FString ClassFilter;
 	Params->TryGetStringField(TEXT("class_filter"), ClassFilter);
 
+	FString BlueprintName;
+	Params->TryGetStringField(TEXT("blueprint_name"), BlueprintName);
+
+	// Pre-tokenize the query once for the scorer.
+	TArray<FString> QueryTokens;
+	Keyword.ParseIntoArrayWS(QueryTokens);
+
+	// -------------------------------------------------------------------------
+	// Build the context + filter if a blueprint was supplied. When no blueprint
+	// is supplied we leave BP/Graph/TargetClass slots empty, which means the
+	// engine filter becomes a near-noop (only default rejection tests run) —
+	// this preserves legacy global-search behavior for callers that want it.
+	// -------------------------------------------------------------------------
+	UBlueprint* Blueprint = nullptr;
+	UEdGraph* Graph = nullptr;
+	FBlueprintActionContext FilterContext;
+	FBlueprintActionFilter ActionFilter;  // default ctor registers all rejection tests
+
+	const bool bHasBlueprintScope = !BlueprintName.IsEmpty();
+	if (bHasBlueprintScope)
+	{
+		Blueprint = FUnrealMCPCommonUtils::FindBlueprint(BlueprintName);
+		if (!Blueprint)
+		{
+			return FUnrealMCPCommonUtils::CreateErrorResponse(
+				FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintName));
+		}
+
+		Graph = FUnrealMCPCommonUtils::FindOrCreateEventGraph(Blueprint);
+
+		FilterContext.Blueprints.Add(Blueprint);
+		if (Graph)
+		{
+			FilterContext.Graphs.Add(Graph);
+		}
+
+		ActionFilter.Context = FilterContext;
+
+		// TargetClass restricts member fields to those callable on the BP's own
+		// class hierarchy (reachable via BP self-reference). Guard against an
+		// unskelatonized / freshly-created blueprint where SkeletonGeneratedClass
+		// may still be null — in that case we fall back to GeneratedClass.
+		UClass* TargetClass = Blueprint->SkeletonGeneratedClass;
+		if (!TargetClass)
+		{
+			TargetClass = Blueprint->GeneratedClass;
+		}
+		if (TargetClass)
+		{
+			FBlueprintActionFilter::Add(ActionFilter.TargetClasses, TargetClass);
+		}
+	}
+
 	FBlueprintActionDatabase& ActionDB = FBlueprintActionDatabase::Get();
 	const FBlueprintActionDatabase::FActionRegistry& AllActions = ActionDB.GetAllActions();
 
-	TArray<TSharedPtr<FJsonValue>> Results;
-	int32 TotalMatches = 0;
+	// Collect every scoring candidate (filtered + keyword-matched) so we can
+	// rank by score before applying pagination. total_matches in the response
+	// reflects the *post-filter* candidate count.
+	TArray<FScoredCandidate> Candidates;
+	Candidates.Reserve(256);
 
 	for (const TPair<FObjectKey, FBlueprintActionDatabase::FActionList>& Pair : AllActions)
 	{
 		const FObjectKey& Key = Pair.Key;
 		const FBlueprintActionDatabase::FActionList& SpawnerList = Pair.Value;
+
+		// Resolve key once (may be null for unloaded assets — we handle later).
+		UObject* OwnerObj = Key.ResolveObjectPtr();
+
+		// class_filter is an optional string match on the owner's short name;
+		// independent of the engine filter.
+		if (!ClassFilter.IsEmpty())
+		{
+			if (!OwnerObj || !OwnerObj->GetName().Contains(ClassFilter, ESearchCase::IgnoreCase))
+			{
+				continue;
+			}
+		}
 
 		for (int32 SpawnerIdx = 0; SpawnerIdx < SpawnerList.Num(); ++SpawnerIdx)
 		{
@@ -99,68 +243,88 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintSearchCommands::HandleSearchBlueprint
 				continue;
 			}
 
-			// Get display info
-			const FBlueprintActionUiSpec& UiSpec = Spawner->PrimeDefaultUiSpec();
+			// Apply the engine-canonical filter when a blueprint scope exists.
+			// When OwnerObj is null (unloaded asset) the FBlueprintActionInfo
+			// constructor can still accept nullptr, but Filter.IsFiltered may
+			// touch it — skip defensively in that case.
+			if (bHasBlueprintScope)
+			{
+				if (!OwnerObj)
+				{
+					continue;
+				}
+				FBlueprintActionInfo Info(OwnerObj, Spawner);
+				if (ActionFilter.IsFiltered(Info))
+				{
+					continue;  // failed the filter → not available in this context
+				}
+			}
 
-			FString ActionName = UiSpec.MenuName.ToString();
-			FString Category = UiSpec.Category.ToString();
-			FString Keywords = UiSpec.Keywords.ToString();
+			// Use the dynamic ui spec (falls back to PrimeDefaultUiSpec when
+			// there's no override), passing the context + empty bindings so
+			// context-aware display names ("Set Counter" on self vs on target)
+			// resolve correctly.
+			FBlueprintActionUiSpec Ui = Spawner->GetUiSpec(
+				FilterContext, IBlueprintNodeBinder::FBindingSet());
 
-			// Skip empty entries
-			if (ActionName.IsEmpty())
+			FString MenuName = Ui.MenuName.ToString();
+			if (MenuName.IsEmpty())
+			{
+				continue;
+			}
+			FString Tooltip = Ui.Tooltip.ToString();
+			FString CategoryStr = Ui.Category.ToString();
+			FString KeywordsStr = Ui.Keywords.ToString();
+
+			int32 Score = ComputeScore(MenuName, Tooltip, KeywordsStr, Keyword, QueryTokens);
+			if (Score <= 0)
 			{
 				continue;
 			}
 
-			// Class filter
-			if (!ClassFilter.IsEmpty())
-			{
-				UObject* OwnerObj = Key.ResolveObjectPtr();
-				if (OwnerObj)
-				{
-					FString OwnerName = OwnerObj->GetName();
-					if (!OwnerName.Contains(ClassFilter, ESearchCase::IgnoreCase))
-					{
-						continue;
-					}
-				}
-				else
-				{
-					continue;
-				}
-			}
-
-			// Keyword filter
-			bool bMatches = ActionName.Contains(Keyword, ESearchCase::IgnoreCase) ||
-				Category.Contains(Keyword, ESearchCase::IgnoreCase) ||
-				Keywords.Contains(Keyword, ESearchCase::IgnoreCase);
-
-			if (bMatches)
-			{
-				if (TotalMatches >= Offset && Results.Num() < Limit)
-				{
-					TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
-					ResultObj->SetStringField(TEXT("action_name"), ActionName);
-					ResultObj->SetStringField(TEXT("category"), Category);
-					ResultObj->SetStringField(TEXT("keywords"), Keywords);
-					ResultObj->SetStringField(TEXT("node_class"),
-						Spawner->NodeClass ? Spawner->NodeClass->GetName() : TEXT("Unknown"));
-
-					// Create an action key for place_searched_action
-					FString OwnerPath;
-					UObject* OwnerObj = Key.ResolveObjectPtr();
-					if (OwnerObj)
-					{
-						OwnerPath = OwnerObj->GetPathName();
-					}
-					ResultObj->SetStringField(TEXT("owner_path"), OwnerPath);
-					ResultObj->SetNumberField(TEXT("spawner_index"), SpawnerIdx);
-
-					Results.Add(MakeShared<FJsonValueObject>(ResultObj));
-				}
-				TotalMatches++;
-			}
+			FScoredCandidate Candidate;
+			Candidate.Score = Score;
+			Candidate.OwnerKey = Key;
+			Candidate.SpawnerIndex = SpawnerIdx;
+			Candidate.Spawner = Spawner;
+			Candidate.MenuName = MoveTemp(MenuName);
+			Candidate.Category = MoveTemp(CategoryStr);
+			Candidate.Keywords = MoveTemp(KeywordsStr);
+			Candidates.Add(MoveTemp(Candidate));
 		}
+	}
+
+	// Sort by score descending. Use StableSort so results with equal score keep
+	// their discovery order (deterministic for regression tests).
+	Candidates.StableSort([](const FScoredCandidate& A, const FScoredCandidate& B)
+	{
+		return A.Score > B.Score;
+	});
+
+	const int32 TotalMatches = Candidates.Num();
+	TArray<TSharedPtr<FJsonValue>> Results;
+
+	const int32 Start = FMath::Min(Offset, TotalMatches);
+	const int32 End = FMath::Min(Start + Limit, TotalMatches);
+	for (int32 Idx = Start; Idx < End; ++Idx)
+	{
+		const FScoredCandidate& C = Candidates[Idx];
+		TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+		ResultObj->SetStringField(TEXT("action_name"), C.MenuName);
+		ResultObj->SetStringField(TEXT("category"), C.Category);
+		ResultObj->SetStringField(TEXT("keywords"), C.Keywords);
+		ResultObj->SetStringField(TEXT("node_class"),
+			(C.Spawner && C.Spawner->NodeClass) ? C.Spawner->NodeClass->GetName() : TEXT("Unknown"));
+
+		FString OwnerPath;
+		if (UObject* OwnerObj = C.OwnerKey.ResolveObjectPtr())
+		{
+			OwnerPath = OwnerObj->GetPathName();
+		}
+		ResultObj->SetStringField(TEXT("owner_path"), OwnerPath);
+		ResultObj->SetNumberField(TEXT("spawner_index"), C.SpawnerIndex);
+
+		Results.Add(MakeShared<FJsonValueObject>(ResultObj));
 	}
 
 	TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
@@ -169,6 +333,7 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintSearchCommands::HandleSearchBlueprint
 	Data->SetNumberField(TEXT("offset"), Offset);
 	Data->SetNumberField(TEXT("limit"), Limit);
 	Data->SetNumberField(TEXT("returned"), Results.Num());
+	Data->SetBoolField(TEXT("context_filtered"), bHasBlueprintScope);
 
 	return FUnrealMCPCommonUtils::CreateSuccessResponse(Data);
 }
