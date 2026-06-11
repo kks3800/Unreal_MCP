@@ -19,6 +19,9 @@
 #include "Subsystems/AssetEditorSubsystem.h"
 #include "Engine/Blueprint.h"
 #include "Engine/BlueprintGeneratedClass.h"
+#include "FileHelpers.h"
+#include "Misc/PackageName.h"
+#include "UObject/SavePackage.h"
 #include "Framework/Docking/TabManager.h"
 #include "IImageWrapperModule.h"
 #include "IImageWrapper.h"
@@ -60,6 +63,22 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleCommand(const FString& C
     else if (CommandType == TEXT("set_actor_transform"))
     {
         return HandleSetActorTransform(Params);
+    }
+    else if (CommandType == TEXT("fix_null_static_mesh_actors"))
+    {
+        return HandleFixNullStaticMeshActors(Params);
+    }
+    else if (CommandType == TEXT("organize_outliner_by_class"))
+    {
+        return HandleOrganizeOutlinerByClass(Params);
+    }
+    else if (CommandType == TEXT("list_static_mesh_actors"))
+    {
+        return HandleListStaticMeshActors(Params);
+    }
+    else if (CommandType == TEXT("set_actor_folders"))
+    {
+        return HandleSetActorFolders(Params);
     }
     else if (CommandType == TEXT("get_actor_properties"))
     {
@@ -562,7 +581,96 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleGetActorProperties(const
     }
 
     // Always return detailed properties for this command
-    return FUnrealMCPCommonUtils::ActorToJsonObject(TargetActor, true);
+    TSharedPtr<FJsonObject> Result = FUnrealMCPCommonUtils::ActorToJsonObject(TargetActor, true);
+
+    // Enumerate components + their primitive (numeric/bool/struct) property values.
+    TArray<TSharedPtr<FJsonValue>> CompArray;
+    TArray<UActorComponent*> Comps;
+    TargetActor->GetComponents(Comps);
+    for (UActorComponent* Comp : Comps)
+    {
+        if (!Comp) continue;
+        TSharedPtr<FJsonObject> CompObj = MakeShared<FJsonObject>();
+        CompObj->SetStringField(TEXT("name"), Comp->GetName());
+        CompObj->SetStringField(TEXT("class"), Comp->GetClass()->GetName());
+
+        TSharedPtr<FJsonObject> PropsObj = MakeShared<FJsonObject>();
+        for (TFieldIterator<FProperty> It(Comp->GetClass()); It; ++It)
+        {
+            FProperty* Prop = *It;
+            const FString PropName = Prop->GetName();
+            if (FFloatProperty* FP = CastField<FFloatProperty>(Prop))
+            {
+                PropsObj->SetNumberField(PropName, FP->GetPropertyValue_InContainer(Comp));
+            }
+            else if (FDoubleProperty* DP = CastField<FDoubleProperty>(Prop))
+            {
+                PropsObj->SetNumberField(PropName, DP->GetPropertyValue_InContainer(Comp));
+            }
+            else if (FIntProperty* IP = CastField<FIntProperty>(Prop))
+            {
+                PropsObj->SetNumberField(PropName, IP->GetPropertyValue_InContainer(Comp));
+            }
+            else if (FBoolProperty* BoP = CastField<FBoolProperty>(Prop))
+            {
+                PropsObj->SetBoolField(PropName, BoP->GetPropertyValue_InContainer(Comp));
+            }
+            else if (FByteProperty* BYP = CastField<FByteProperty>(Prop))
+            {
+                if (UEnum* E = BYP->Enum)
+                {
+                    int64 V = BYP->GetPropertyValue_InContainer(Comp);
+                    PropsObj->SetStringField(PropName, E->GetNameStringByValue(V));
+                }
+                else
+                {
+                    PropsObj->SetNumberField(PropName, BYP->GetPropertyValue_InContainer(Comp));
+                }
+            }
+            else if (FEnumProperty* EP = CastField<FEnumProperty>(Prop))
+            {
+                int64 V = EP->GetUnderlyingProperty()->GetSignedIntPropertyValue(
+                    EP->ContainerPtrToValuePtr<void>(Comp));
+                UEnum* E = EP->GetEnum();
+                PropsObj->SetStringField(PropName, E ? E->GetNameStringByValue(V) : FString::FromInt(V));
+            }
+            else if (FStructProperty* SP = CastField<FStructProperty>(Prop))
+            {
+                if (SP->Struct == TBaseStructure<FVector>::Get())
+                {
+                    FVector V = *SP->ContainerPtrToValuePtr<FVector>(Comp);
+                    TArray<TSharedPtr<FJsonValue>> A;
+                    A.Add(MakeShared<FJsonValueNumber>(V.X));
+                    A.Add(MakeShared<FJsonValueNumber>(V.Y));
+                    A.Add(MakeShared<FJsonValueNumber>(V.Z));
+                    PropsObj->SetArrayField(PropName, A);
+                }
+                else if (SP->Struct == TBaseStructure<FLinearColor>::Get())
+                {
+                    FLinearColor C = *SP->ContainerPtrToValuePtr<FLinearColor>(Comp);
+                    TArray<TSharedPtr<FJsonValue>> A;
+                    A.Add(MakeShared<FJsonValueNumber>(C.R));
+                    A.Add(MakeShared<FJsonValueNumber>(C.G));
+                    A.Add(MakeShared<FJsonValueNumber>(C.B));
+                    A.Add(MakeShared<FJsonValueNumber>(C.A));
+                    PropsObj->SetArrayField(PropName, A);
+                }
+                else if (SP->Struct == TBaseStructure<FRotator>::Get())
+                {
+                    FRotator R = *SP->ContainerPtrToValuePtr<FRotator>(Comp);
+                    TArray<TSharedPtr<FJsonValue>> A;
+                    A.Add(MakeShared<FJsonValueNumber>(R.Pitch));
+                    A.Add(MakeShared<FJsonValueNumber>(R.Yaw));
+                    A.Add(MakeShared<FJsonValueNumber>(R.Roll));
+                    PropsObj->SetArrayField(PropName, A);
+                }
+            }
+        }
+        CompObj->SetObjectField(TEXT("properties"), PropsObj);
+        CompArray.Add(MakeShared<FJsonValueObject>(CompObj));
+    }
+    Result->SetArrayField(TEXT("components"), CompArray);
+    return Result;
 }
 
 TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleGetActorMaterialInfo(const TSharedPtr<FJsonObject>& Params)
@@ -1228,6 +1336,386 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleSetCVar(const TSharedPtr
 }
 
 // ============================================================================
+// BULK OUTLINER / CLEANUP
+// ============================================================================
+
+// Scan the given world for AStaticMeshActor with no StaticMesh set, destroy them.
+// Uses UEditorActorSubsystem so the editor properly marks the level dirty.
+// Returns count + names of deleted actors.
+static int32 ScanAndDestroyNullSMA(UWorld* World, TArray<FString>& OutDeletedNames)
+{
+    if (!World) return 0;
+    UEditorActorSubsystem* ActorSub = GEditor ? GEditor->GetEditorSubsystem<UEditorActorSubsystem>() : nullptr;
+
+    TArray<AActor*> Actors;
+    UGameplayStatics::GetAllActorsOfClass(World, AStaticMeshActor::StaticClass(), Actors);
+    int32 Deleted = 0;
+    for (AActor* A : Actors)
+    {
+        AStaticMeshActor* SMA = Cast<AStaticMeshActor>(A);
+        if (!SMA) continue;
+        UStaticMeshComponent* SMC = SMA->GetStaticMeshComponent();
+        if (!SMC || !SMC->GetStaticMesh())
+        {
+            OutDeletedNames.Add(SMA->GetName());
+            // Explicitly mark level dirty in case the subsystem path doesn't.
+            if (ULevel* Lvl = SMA->GetLevel())
+            {
+                Lvl->MarkPackageDirty();
+            }
+            bool bOk = false;
+            if (ActorSub)
+            {
+                bOk = ActorSub->DestroyActor(SMA);
+            }
+            if (!bOk)
+            {
+                // Fallback: World->DestroyActor with editor flags
+                World->EditorDestroyActor(SMA, true);
+            }
+            ++Deleted;
+        }
+    }
+    return Deleted;
+}
+
+// Save the currently loaded editor world's persistent level via the editor's
+// proper save path (FEditorFileUtils::SaveLevel), which writes the .umap and
+// clears the dirty flag.
+static bool SaveCurrentEditorMap()
+{
+    UWorld* W = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!W || !W->PersistentLevel) return false;
+    return FEditorFileUtils::SaveLevel(W->PersistentLevel, FString());
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleFixNullStaticMeshActors(const TSharedPtr<FJsonObject>& Params)
+{
+    // Parse params
+    TArray<FString> MapPaths;
+    const TArray<TSharedPtr<FJsonValue>>* MapPathsArray = nullptr;
+    if (Params->TryGetArrayField(TEXT("map_paths"), MapPathsArray))
+    {
+        for (const TSharedPtr<FJsonValue>& V : *MapPathsArray)
+        {
+            FString S; if (V->TryGetString(S)) MapPaths.Add(S);
+        }
+    }
+    bool bIncludePersistent = true;
+    Params->TryGetBoolField(TEXT("include_persistent"), bIncludePersistent);
+    bool bSave = true;
+    Params->TryGetBoolField(TEXT("save"), bSave);
+    bool bRestoreOriginal = true;
+    Params->TryGetBoolField(TEXT("restore_original"), bRestoreOriginal);
+
+    // Remember original map (long package name, e.g. /Game/.../ModernMansions)
+    FString OriginalMapPath;
+    if (UWorld* W = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr)
+    {
+        OriginalMapPath = W->GetOutermost()->GetName();
+    }
+
+    TArray<TSharedPtr<FJsonValue>> Reports;
+    int32 GrandTotal = 0;
+
+    auto AppendReport = [&Reports, &GrandTotal](const FString& MapPath, int32 N, bool bSaved, const TArray<FString>& Names, const FString& Err)
+    {
+        TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("map_path"), MapPath);
+        R->SetNumberField(TEXT("deleted_count"), N);
+        R->SetBoolField(TEXT("saved"), bSaved);
+        if (!Err.IsEmpty()) R->SetStringField(TEXT("error"), Err);
+        TArray<TSharedPtr<FJsonValue>> NameArr;
+        for (const FString& N2 : Names) NameArr.Add(MakeShared<FJsonValueString>(N2));
+        R->SetArrayField(TEXT("deleted_names"), NameArr);
+        Reports.Add(MakeShared<FJsonValueObject>(R));
+        GrandTotal += N;
+    };
+
+    // Persistent (current) map first
+    if (bIncludePersistent)
+    {
+        UWorld* CurW = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+        TArray<FString> Deleted;
+        int32 N = ScanAndDestroyNullSMA(CurW, Deleted);
+        bool bSaved = false;
+        if (N > 0 && bSave) bSaved = SaveCurrentEditorMap();
+        AppendReport(OriginalMapPath, N, bSaved, Deleted, FString());
+    }
+
+    // Sublevels: load each, scan, save, continue
+    for (const FString& MapPath : MapPaths)
+    {
+        if (MapPath == OriginalMapPath) continue; // already done
+
+        FString Filename;
+        if (!FPackageName::TryConvertLongPackageNameToFilename(MapPath, Filename, FPackageName::GetMapPackageExtension()))
+        {
+            AppendReport(MapPath, 0, false, {}, TEXT("Could not resolve package path to filename"));
+            continue;
+        }
+
+        // LoadMap: third arg shows progress; second arg is bLoadAsTemplate
+        const bool bLoaded = FEditorFileUtils::LoadMap(Filename, false, false);
+        if (!bLoaded)
+        {
+            AppendReport(MapPath, 0, false, {}, TEXT("FEditorFileUtils::LoadMap failed"));
+            continue;
+        }
+
+        UWorld* W = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+        TArray<FString> Deleted;
+        int32 N = ScanAndDestroyNullSMA(W, Deleted);
+        bool bSaved = false;
+        if (N > 0 && bSave) bSaved = SaveCurrentEditorMap();
+        AppendReport(MapPath, N, bSaved, Deleted, FString());
+    }
+
+    // Restore original
+    if (bRestoreOriginal && !OriginalMapPath.IsEmpty())
+    {
+        FString OriginalFilename;
+        if (FPackageName::TryConvertLongPackageNameToFilename(OriginalMapPath, OriginalFilename, FPackageName::GetMapPackageExtension()))
+        {
+            FEditorFileUtils::LoadMap(OriginalFilename, false, false);
+        }
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetNumberField(TEXT("total_deleted"), GrandTotal);
+    ResultObj->SetStringField(TEXT("original_map"), OriginalMapPath);
+    ResultObj->SetArrayField(TEXT("per_map"), Reports);
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleOrganizeOutlinerByClass(const TSharedPtr<FJsonObject>& Params)
+{
+    // Required: class_to_folder = { "StaticMeshActor": "Geometry", ... }
+    // Optional: only_if_empty (default true) — only touch actors with no current folder
+    //           skip_level_instance_content (default true) — skip actors not in the persistent level
+    //           match_parent_classes (default true) — if exact class not found, walk up the class chain
+    //           save (default true) — save the persistent map afterwards
+    const TSharedPtr<FJsonObject>* MapObj = nullptr;
+    if (!Params->TryGetObjectField(TEXT("class_to_folder"), MapObj))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'class_to_folder' parameter"));
+    }
+
+    TMap<FString, FString> ClassToFolder;
+    for (const auto& Pair : (*MapObj)->Values)
+    {
+        FString V;
+        if (Pair.Value->TryGetString(V) && !V.IsEmpty())
+        {
+            ClassToFolder.Add(Pair.Key, V);
+        }
+    }
+    if (ClassToFolder.Num() == 0)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("'class_to_folder' map is empty"));
+    }
+
+    bool bOnlyIfEmpty = true;
+    Params->TryGetBoolField(TEXT("only_if_empty"), bOnlyIfEmpty);
+    bool bSkipLI = true;
+    Params->TryGetBoolField(TEXT("skip_level_instance_content"), bSkipLI);
+    bool bMatchParents = true;
+    Params->TryGetBoolField(TEXT("match_parent_classes"), bMatchParents);
+    bool bSave = true;
+    Params->TryGetBoolField(TEXT("save"), bSave);
+
+    UWorld* W = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!W || !W->PersistentLevel)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No editor world"));
+    }
+
+    TArray<AActor*> Actors;
+    UGameplayStatics::GetAllActorsOfClass(W, AActor::StaticClass(), Actors);
+
+    int32 ChangedTotal = 0;
+    int32 SkippedLI = 0;
+    int32 SkippedNonEmpty = 0;
+    int32 SkippedNoMatch = 0;
+    TMap<FString, int32> CountsByFolder;
+
+    for (AActor* A : Actors)
+    {
+        if (!A) continue;
+        if (bSkipLI && A->GetLevel() != W->PersistentLevel)
+        {
+            SkippedLI++;
+            continue;
+        }
+
+        const FString* FolderTarget = ClassToFolder.Find(A->GetClass()->GetName());
+        if (!FolderTarget && bMatchParents)
+        {
+            for (UClass* C = A->GetClass()->GetSuperClass(); C && !FolderTarget; C = C->GetSuperClass())
+            {
+                FolderTarget = ClassToFolder.Find(C->GetName());
+            }
+        }
+        if (!FolderTarget)
+        {
+            SkippedNoMatch++;
+            continue;
+        }
+
+        if (bOnlyIfEmpty)
+        {
+            FString Cur = A->GetFolderPath().ToString();
+            if (!Cur.IsEmpty() && Cur != TEXT("None"))
+            {
+                SkippedNonEmpty++;
+                continue;
+            }
+        }
+
+        A->SetFolderPath(FName(**FolderTarget));
+        CountsByFolder.FindOrAdd(*FolderTarget)++;
+        ChangedTotal++;
+    }
+
+    bool bSaved = false;
+    if (ChangedTotal > 0)
+    {
+        W->PersistentLevel->MarkPackageDirty();
+        if (bSave) bSaved = FEditorFileUtils::SaveLevel(W->PersistentLevel, FString());
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetNumberField(TEXT("total_changed"), ChangedTotal);
+    Result->SetNumberField(TEXT("skipped_level_instance_content"), SkippedLI);
+    Result->SetNumberField(TEXT("skipped_already_in_folder"), SkippedNonEmpty);
+    Result->SetNumberField(TEXT("skipped_no_class_match"), SkippedNoMatch);
+    Result->SetBoolField(TEXT("saved"), bSaved);
+    TSharedPtr<FJsonObject> ByFolder = MakeShared<FJsonObject>();
+    for (const auto& P : CountsByFolder) ByFolder->SetNumberField(P.Key, P.Value);
+    Result->SetObjectField(TEXT("by_folder"), ByFolder);
+    return Result;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleListStaticMeshActors(const TSharedPtr<FJsonObject>& Params)
+{
+    // persistent_only: bool, default true — restrict to actors in the persistent level
+    // folder_filter: optional string — only return actors whose current folder matches exactly
+    UWorld* W = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!W) return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No editor world"));
+
+    bool bPersistentOnly = true;
+    Params->TryGetBoolField(TEXT("persistent_only"), bPersistentOnly);
+    FString FolderFilter;
+    Params->TryGetStringField(TEXT("folder_filter"), FolderFilter);
+
+    TArray<AActor*> Actors;
+    UGameplayStatics::GetAllActorsOfClass(W, AStaticMeshActor::StaticClass(), Actors);
+
+    TArray<TSharedPtr<FJsonValue>> Arr;
+    for (AActor* A : Actors)
+    {
+        AStaticMeshActor* SMA = Cast<AStaticMeshActor>(A);
+        if (!SMA) continue;
+        if (bPersistentOnly && SMA->GetLevel() != W->PersistentLevel) continue;
+
+        FString CurFolder = SMA->GetFolderPath().ToString();
+        if (!FolderFilter.IsEmpty() && CurFolder != FolderFilter) continue;
+
+        UStaticMeshComponent* SMC = SMA->GetStaticMeshComponent();
+        UStaticMesh* Mesh = SMC ? SMC->GetStaticMesh() : nullptr;
+
+        TSharedPtr<FJsonObject> Item = MakeShared<FJsonObject>();
+        Item->SetStringField(TEXT("name"), SMA->GetName());
+        Item->SetStringField(TEXT("folder_path"), CurFolder);
+        Item->SetStringField(TEXT("mesh_path"), Mesh ? Mesh->GetPathName() : FString());
+        Item->SetStringField(TEXT("mesh_name"), Mesh ? Mesh->GetName() : FString());
+        FVector L = SMA->GetActorLocation();
+        TArray<TSharedPtr<FJsonValue>> Loc;
+        Loc.Add(MakeShared<FJsonValueNumber>(L.X));
+        Loc.Add(MakeShared<FJsonValueNumber>(L.Y));
+        Loc.Add(MakeShared<FJsonValueNumber>(L.Z));
+        Item->SetArrayField(TEXT("location"), Loc);
+        Arr.Add(MakeShared<FJsonValueObject>(Item));
+    }
+
+    TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+    R->SetArrayField(TEXT("actors"), Arr);
+    R->SetNumberField(TEXT("count"), Arr.Num());
+    return R;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleSetActorFolders(const TSharedPtr<FJsonObject>& Params)
+{
+    // actor_to_folder: dict actor_name -> folder_path
+    // save: bool, default true
+    const TSharedPtr<FJsonObject>* MapObj = nullptr;
+    if (!Params->TryGetObjectField(TEXT("actor_to_folder"), MapObj))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'actor_to_folder' parameter"));
+    }
+    TMap<FString, FString> NameToFolder;
+    for (const auto& Pair : (*MapObj)->Values)
+    {
+        FString V;
+        if (Pair.Value->TryGetString(V)) NameToFolder.Add(Pair.Key, V);
+    }
+    if (NameToFolder.Num() == 0)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("'actor_to_folder' map is empty"));
+    }
+
+    bool bSave = true;
+    Params->TryGetBoolField(TEXT("save"), bSave);
+
+    UWorld* W = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!W || !W->PersistentLevel)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No editor world"));
+    }
+
+    TArray<AActor*> Actors;
+    UGameplayStatics::GetAllActorsOfClass(W, AActor::StaticClass(), Actors);
+
+    int32 Changed = 0;
+    TSet<FString> Seen;
+    for (AActor* A : Actors)
+    {
+        if (!A) continue;
+        if (A->GetLevel() != W->PersistentLevel) continue;
+        const FString* Tgt = NameToFolder.Find(A->GetName());
+        if (!Tgt) continue;
+        A->SetFolderPath(FName(**Tgt));
+        Seen.Add(A->GetName());
+        ++Changed;
+    }
+
+    int32 NotFound = 0;
+    TArray<TSharedPtr<FJsonValue>> MissingArr;
+    for (const auto& P : NameToFolder)
+    {
+        if (!Seen.Contains(P.Key))
+        {
+            ++NotFound;
+            MissingArr.Add(MakeShared<FJsonValueString>(P.Key));
+        }
+    }
+
+    bool bSaved = false;
+    if (Changed > 0)
+    {
+        W->PersistentLevel->MarkPackageDirty();
+        if (bSave) bSaved = FEditorFileUtils::SaveLevel(W->PersistentLevel, FString());
+    }
+
+    TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+    R->SetNumberField(TEXT("changed"), Changed);
+    R->SetNumberField(TEXT("not_found"), NotFound);
+    R->SetArrayField(TEXT("missing_actor_names"), MissingArr);
+    R->SetBoolField(TEXT("saved"), bSaved);
+    return R;
+}
+
+// ============================================================================
 // COMMAND REGISTRATION
 // ============================================================================
 
@@ -1269,4 +1757,12 @@ void FUnrealMCPEditorCommands::RegisterCommands(FMCPCommandRegistry& Registry)
 		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("get_actor_material_info"), P); });
 	Registry.RegisterCommand(TEXT("set_actor_material"),
 		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("set_actor_material"), P); });
+	Registry.RegisterCommand(TEXT("fix_null_static_mesh_actors"),
+		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("fix_null_static_mesh_actors"), P); });
+	Registry.RegisterCommand(TEXT("organize_outliner_by_class"),
+		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("organize_outliner_by_class"), P); });
+	Registry.RegisterCommand(TEXT("list_static_mesh_actors"),
+		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("list_static_mesh_actors"), P); });
+	Registry.RegisterCommand(TEXT("set_actor_folders"),
+		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("set_actor_folders"), P); });
 }

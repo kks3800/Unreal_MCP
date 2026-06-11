@@ -27,6 +27,75 @@
 // Phase 10: transactional batch execution so a single undo reverts the whole build
 #include "ScopedTransaction.h"
 
+#if PLATFORM_WINDOWS
+#include "Windows/AllowWindowsPlatformTypes.h"
+#include <excpt.h>
+#include "Windows/HideWindowsPlatformTypes.h"
+#endif
+
+// SEH-guarded property writers. Windows access violations (EXCEPTION_ACCESS_VIOLATION)
+// raised inside UObject/Engine while writing to component CDOs or while marking
+// a Blueprint dirty cannot be caught by C++ try/catch under /EHsc. These helpers
+// wrap each unsafe call in __try/__except so the editor stays alive and we return
+// a normal error response. Each helper body must contain ONLY raw calls — no
+// constructed C++ objects with destructors — to satisfy the SEH/C++ unwind rule.
+namespace
+{
+#if PLATFORM_WINDOWS
+    bool SEH_SetIntProperty(FNumericProperty* Prop, void* Container, int64 Value)
+    {
+        __try { Prop->SetIntPropertyValue(Container, Value); return true; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    bool SEH_SetFloatProperty(FNumericProperty* Prop, void* Container, double Value)
+    {
+        __try { Prop->SetFloatingPointPropertyValue(Container, Value); return true; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    bool SEH_SetEnumValue(FEnumProperty* Prop, void* Container, int64 Value)
+    {
+        __try { Prop->GetUnderlyingProperty()->SetIntPropertyValue(Container, Value); return true; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    bool SEH_CopyStructValue(FStructProperty* Prop, void* Dest, const void* Src)
+    {
+        __try { Prop->CopySingleValue(Dest, Src); return true; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    // C2712 workaround: MarkBlueprintAsModified internally constructs objects
+    // with destructors which forces object unwinding in the enclosing function
+    // and disallows SEH __try. Isolate the C++ side into a separate helper so
+    // the SEH wrapper has only POD operations.
+    static void Inner_MarkBlueprintModified(UBlueprint* B)
+    {
+        FBlueprintEditorUtils::MarkBlueprintAsModified(B);
+    }
+    bool SEH_MarkBlueprintModified(UBlueprint* Blueprint)
+    {
+        __try { Inner_MarkBlueprintModified(Blueprint); return true; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    bool SEH_GenericSetObjectProperty(UObject* Obj, const FString& PropertyName, const TSharedPtr<FJsonValue>& JsonValue, FString& OutError)
+    {
+        __try { return FUnrealMCPCommonUtils::SetObjectProperty(Obj, PropertyName, JsonValue, OutError); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+#else
+    bool SEH_SetIntProperty(FNumericProperty* Prop, void* Container, int64 Value)
+    { Prop->SetIntPropertyValue(Container, Value); return true; }
+    bool SEH_SetFloatProperty(FNumericProperty* Prop, void* Container, double Value)
+    { Prop->SetFloatingPointPropertyValue(Container, Value); return true; }
+    bool SEH_SetEnumValue(FEnumProperty* Prop, void* Container, int64 Value)
+    { Prop->GetUnderlyingProperty()->SetIntPropertyValue(Container, Value); return true; }
+    bool SEH_CopyStructValue(FStructProperty* Prop, void* Dest, const void* Src)
+    { Prop->CopySingleValue(Dest, Src); return true; }
+    bool SEH_MarkBlueprintModified(UBlueprint* Blueprint)
+    { FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint); return true; }
+    bool SEH_GenericSetObjectProperty(UObject* Obj, const FString& PropertyName, const TSharedPtr<FJsonValue>& JsonValue, FString& OutError)
+    { return FUnrealMCPCommonUtils::SetObjectProperty(Obj, PropertyName, JsonValue, OutError); }
+#endif
+}
+
 FUnrealMCPBlueprintCommands::FUnrealMCPBlueprintCommands()
 {
 }
@@ -587,7 +656,12 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleSetComponentProperty(
 
         // Handle different property types
         UE_LOG(LogTemp, Log, TEXT("SetComponentProperty - Attempting to set property %s"), *PropertyName);
-        
+
+        // No edit-lifecycle bracketing — Modify/PreEdit/PostEdit all crash on
+        // various component CDO properties. Save path uses direct SavePackage
+        // so we don't need transactional state here. User must Ctrl+S in
+        // editor for property changes that affect placed instances.
+
         // Add try-catch block to catch and log any crashes
         try
         {
@@ -611,10 +685,10 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleSetComponentProperty(
                                 Arr[2]->AsNumber()
                             );
                             void* PropertyAddr = StructProp->ContainerPtrToValuePtr<void>(ComponentTemplate);
-                            UE_LOG(LogTemp, Log, TEXT("SetComponentProperty - Setting Vector(%f, %f, %f)"), 
+                            UE_LOG(LogTemp, Log, TEXT("SetComponentProperty - Setting Vector(%f, %f, %f)"),
                                 Vec.X, Vec.Y, Vec.Z);
-                            StructProp->CopySingleValue(PropertyAddr, &Vec);
-                            bSuccess = true;
+                            bSuccess = SEH_CopyStructValue(StructProp, PropertyAddr, &Vec);
+                            if (!bSuccess) ErrorMessage = TEXT("Access violation writing Vector property (write skipped)");
                         }
                         else
                         {
@@ -628,10 +702,10 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleSetComponentProperty(
                         float Value = JsonValue->AsNumber();
                         FVector Vec(Value, Value, Value);
                         void* PropertyAddr = StructProp->ContainerPtrToValuePtr<void>(ComponentTemplate);
-                        UE_LOG(LogTemp, Log, TEXT("SetComponentProperty - Setting Vector(%f, %f, %f) from scalar"), 
+                        UE_LOG(LogTemp, Log, TEXT("SetComponentProperty - Setting Vector(%f, %f, %f) from scalar"),
                             Vec.X, Vec.Y, Vec.Z);
-                        StructProp->CopySingleValue(PropertyAddr, &Vec);
-                        bSuccess = true;
+                        bSuccess = SEH_CopyStructValue(StructProp, PropertyAddr, &Vec);
+                        if (!bSuccess) ErrorMessage = TEXT("Access violation writing Vector property from scalar (write skipped)");
                     }
                     else
                     {
@@ -641,12 +715,13 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleSetComponentProperty(
                 }
                 else
                 {
-                    // Handle other struct properties using default handler
-                    UE_LOG(LogTemp, Log, TEXT("SetComponentProperty - Using generic struct handler for %s"), 
+                    // Handle other struct properties using default handler (SEH-guarded)
+                    UE_LOG(LogTemp, Log, TEXT("SetComponentProperty - Using generic struct handler for %s"),
                         *PropertyName);
-                    bSuccess = FUnrealMCPCommonUtils::SetObjectProperty(ComponentTemplate, PropertyName, JsonValue, ErrorMessage);
+                    bSuccess = SEH_GenericSetObjectProperty(ComponentTemplate, PropertyName, JsonValue, ErrorMessage);
                     if (!bSuccess)
                     {
+                        if (ErrorMessage.IsEmpty()) ErrorMessage = TEXT("Access violation writing struct property (write skipped)");
                         UE_LOG(LogTemp, Error, TEXT("SetComponentProperty - Failed to set struct property: %s"), *ErrorMessage);
                     }
                 }
@@ -668,11 +743,8 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleSetComponentProperty(
                         if (EnumValue != INDEX_NONE)
                         {
                             UE_LOG(LogTemp, Log, TEXT("SetComponentProperty - Found enum value: %lld"), EnumValue);
-                            EnumProp->GetUnderlyingProperty()->SetIntPropertyValue(
-                                ComponentTemplate, 
-                                EnumValue
-                            );
-                            bSuccess = true;
+                            bSuccess = SEH_SetEnumValue(EnumProp, ComponentTemplate, EnumValue);
+                            if (!bSuccess) ErrorMessage = TEXT("Access violation writing enum property (write skipped)");
                         }
                         else
                         {
@@ -702,11 +774,8 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleSetComponentProperty(
                     // Allow setting enum by integer value
                     int64 EnumValue = JsonValue->AsNumber();
                     UE_LOG(LogTemp, Log, TEXT("SetComponentProperty - Setting enum from number: %lld"), EnumValue);
-                    EnumProp->GetUnderlyingProperty()->SetIntPropertyValue(
-                        ComponentTemplate, 
-                        EnumValue
-                    );
-                    bSuccess = true;
+                    bSuccess = SEH_SetEnumValue(EnumProp, ComponentTemplate, EnumValue);
+                    if (!bSuccess) ErrorMessage = TEXT("Access violation writing enum property (write skipped)");
                 }
                 else
                 {
@@ -727,15 +796,27 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleSetComponentProperty(
                     
                     if (NumericProp->IsInteger())
                     {
-                        NumericProp->SetIntPropertyValue(ComponentTemplate, (int64)Value);
-                        UE_LOG(LogTemp, Log, TEXT("SetComponentProperty - Set integer value: %lld"), (int64)Value);
-                        bSuccess = true;
+                        bSuccess = SEH_SetIntProperty(NumericProp, ComponentTemplate, (int64)Value);
+                        if (bSuccess)
+                        {
+                            UE_LOG(LogTemp, Log, TEXT("SetComponentProperty - Set integer value: %lld"), (int64)Value);
+                        }
+                        else
+                        {
+                            ErrorMessage = TEXT("Access violation writing integer property (write skipped)");
+                        }
                     }
                     else if (NumericProp->IsFloatingPoint())
                     {
-                        NumericProp->SetFloatingPointPropertyValue(ComponentTemplate, Value);
-                        UE_LOG(LogTemp, Log, TEXT("SetComponentProperty - Set float value: %f"), Value);
-                        bSuccess = true;
+                        bSuccess = SEH_SetFloatProperty(NumericProp, ComponentTemplate, Value);
+                        if (bSuccess)
+                        {
+                            UE_LOG(LogTemp, Log, TEXT("SetComponentProperty - Set float value: %f"), Value);
+                        }
+                        else
+                        {
+                            ErrorMessage = TEXT("Access violation writing float property (write skipped)");
+                        }
                     }
                 }
                 else
@@ -746,12 +827,13 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleSetComponentProperty(
             }
             else
             {
-                // Handle all other property types using default handler
-                UE_LOG(LogTemp, Log, TEXT("SetComponentProperty - Using generic property handler for %s (Type: %s)"), 
+                // Handle all other property types using default handler (SEH-guarded)
+                UE_LOG(LogTemp, Log, TEXT("SetComponentProperty - Using generic property handler for %s (Type: %s)"),
                     *PropertyName, *Property->GetCPPType());
-                bSuccess = FUnrealMCPCommonUtils::SetObjectProperty(ComponentTemplate, PropertyName, JsonValue, ErrorMessage);
+                bSuccess = SEH_GenericSetObjectProperty(ComponentTemplate, PropertyName, JsonValue, ErrorMessage);
                 if (!bSuccess)
                 {
+                    if (ErrorMessage.IsEmpty()) ErrorMessage = TEXT("Access violation writing property (write skipped)");
                     UE_LOG(LogTemp, Error, TEXT("SetComponentProperty - Failed to set property: %s"), *ErrorMessage);
                 }
             }
@@ -771,10 +853,21 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleSetComponentProperty(
 
         if (bSuccess)
         {
-            // Mark the blueprint as modified
-            UE_LOG(LogTemp, Log, TEXT("SetComponentProperty - Successfully set property %s on component %s"), 
+            UE_LOG(LogTemp, Log, TEXT("SetComponentProperty - Successfully set property %s on component %s"),
                 *PropertyName, *ComponentName);
-            if (!FMCPBlueprintContext::Get().IsEditing()) { FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint); }
+            if (!FMCPBlueprintContext::Get().IsEditing())
+            {
+                // SEH-guarded — MarkBlueprintAsModified triggers reinstancing/recompile
+                // which has historically caused access violations on some component CDOs.
+                if (!SEH_MarkBlueprintModified(Blueprint))
+                {
+                    UE_LOG(LogTemp, Error, TEXT("SetComponentProperty - Access violation during MarkBlueprintAsModified for %s; value was written but blueprint not marked dirty. Consider wrapping bulk edits in begin_blueprint_edit/end_blueprint_edit."),
+                        *BlueprintName);
+                    return FUnrealMCPCommonUtils::CreateErrorResponse(
+                        FString::Printf(TEXT("Property %s.%s written but blueprint mark-modified raised an access violation (write skipped at recompile step). Wrap bulk edits in begin_blueprint_edit to defer recompile."),
+                            *ComponentName, *PropertyName));
+                }
+            }
 
             TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
             ResultObj->SetStringField(TEXT("component"), ComponentName);
@@ -784,7 +877,7 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleSetComponentProperty(
         }
         else
         {
-            UE_LOG(LogTemp, Error, TEXT("SetComponentProperty - Failed to set property %s: %s"), 
+            UE_LOG(LogTemp, Error, TEXT("SetComponentProperty - Failed to set property %s: %s"),
                 *PropertyName, *ErrorMessage);
             return FUnrealMCPCommonUtils::CreateErrorResponse(ErrorMessage);
         }

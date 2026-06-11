@@ -52,6 +52,10 @@
 #include "Materials/MaterialExpressionCameraPositionWS.h"
 #include "Materials/MaterialExpressionVertexNormalWS.h"
 #include "Materials/MaterialExpressionPixelNormalWS.h"
+#include "Materials/MaterialExpressionCollectionParameter.h"
+#include "Materials/MaterialParameterCollection.h"
+#include "RHI.h"
+#include "DataDrivenShaderPlatformInfo.h"
 #include "Materials/MaterialExpressionDotProduct.h"
 #include "Materials/MaterialExpressionCrossProduct.h"
 #include "Materials/MaterialExpressionNormalize.h"
@@ -1762,6 +1766,10 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleCommand(const FString&
 	{
 		return HandleRecompileMaterial(Params);
 	}
+	else if (CommandType == TEXT("compile_material_detailed"))
+	{
+		return HandleCompileMaterialDetailed(Params);
+	}
 	else if (CommandType == TEXT("create_material_instance"))
 	{
 		return HandleCreateMaterialInstance(Params);
@@ -2220,6 +2228,34 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleAddMaterialNode(const 
 		}
 	}
 
+	// Handle MaterialFunctionCall — assign target function and regenerate pins.
+	// SetMaterialFunction calls UpdateFromFunctionResource which populates
+	// FunctionInputs/FunctionOutputs so subsequent connect_material_nodes calls
+	// can resolve named pins.
+	if (UMaterialExpressionMaterialFunctionCall* FuncCall = Cast<UMaterialExpressionMaterialFunctionCall>(NewExpression))
+	{
+		FString FuncPath;
+		bool bHaveFuncPath = Params->TryGetStringField(TEXT("function_path"), FuncPath);
+		if (!bHaveFuncPath)
+		{
+			// Also accept it nested under "properties": { "MaterialFunction": "/Game/..." }
+			const TSharedPtr<FJsonObject>* PropsObj = nullptr;
+			if (Params->TryGetObjectField(TEXT("properties"), PropsObj))
+			{
+				bHaveFuncPath = (*PropsObj)->TryGetStringField(TEXT("MaterialFunction"), FuncPath);
+			}
+		}
+		if (bHaveFuncPath)
+		{
+			FString LoadedFuncPath;
+			UMaterialFunction* TargetFunc = LoadMaterialFunction(FuncPath, LoadedFuncPath);
+			if (TargetFunc)
+			{
+				FuncCall->SetMaterialFunction(TargetFunc);
+			}
+		}
+	}
+
 	if (Material) { Material->MarkPackageDirty(); }
 	else if (Function) { Function->MarkPackageDirty(); }
 
@@ -2231,6 +2267,187 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleAddMaterialNode(const 
 #else
 	return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Material editing requires editor"));
 #endif
+}
+
+namespace
+{
+	// Apply a JSON value to a leaf FProperty. Returns true if the property type
+	// was understood and assignment succeeded.
+	bool ApplyJsonValueToLeafProperty(FProperty* Prop, void* ValuePtr, const TSharedPtr<FJsonValue>& Value)
+	{
+		if (!Prop || !ValuePtr || !Value.IsValid()) { return false; }
+
+		if (FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop))
+		{
+			bool bVal;
+			if (Value->TryGetBool(bVal)) { BoolProp->SetPropertyValue(ValuePtr, bVal); return true; }
+		}
+		else if (FFloatProperty* FloatProp = CastField<FFloatProperty>(Prop))
+		{
+			double N;
+			if (Value->TryGetNumber(N)) { FloatProp->SetPropertyValue(ValuePtr, static_cast<float>(N)); return true; }
+		}
+		else if (FDoubleProperty* DoubleProp = CastField<FDoubleProperty>(Prop))
+		{
+			double N;
+			if (Value->TryGetNumber(N)) { DoubleProp->SetPropertyValue(ValuePtr, N); return true; }
+		}
+		else if (FIntProperty* IntProp = CastField<FIntProperty>(Prop))
+		{
+			double N;
+			if (Value->TryGetNumber(N)) { IntProp->SetPropertyValue(ValuePtr, static_cast<int32>(N)); return true; }
+		}
+		else if (FStrProperty* StrProp = CastField<FStrProperty>(Prop))
+		{
+			FString S;
+			if (Value->TryGetString(S)) { StrProp->SetPropertyValue(ValuePtr, S); return true; }
+		}
+		else if (FNameProperty* NameProp = CastField<FNameProperty>(Prop))
+		{
+			FString S;
+			if (Value->TryGetString(S)) { NameProp->SetPropertyValue(ValuePtr, FName(*S)); return true; }
+		}
+		else if (FEnumProperty* EnumProp = CastField<FEnumProperty>(Prop))
+		{
+			FString S; double N;
+			if (Value->TryGetString(S))
+			{
+				int64 V = EnumProp->GetEnum()->GetValueByNameString(S);
+				if (V != INDEX_NONE) { EnumProp->GetUnderlyingProperty()->SetIntPropertyValue(ValuePtr, V); return true; }
+			}
+			else if (Value->TryGetNumber(N))
+			{
+				EnumProp->GetUnderlyingProperty()->SetIntPropertyValue(ValuePtr, static_cast<int64>(N));
+				return true;
+			}
+		}
+		else if (FByteProperty* ByteProp = CastField<FByteProperty>(Prop))
+		{
+			FString S; double N;
+			if (ByteProp->Enum && Value->TryGetString(S))
+			{
+				int64 V = ByteProp->Enum->GetValueByNameString(S);
+				if (V != INDEX_NONE) { ByteProp->SetPropertyValue(ValuePtr, static_cast<uint8>(V)); return true; }
+			}
+			else if (Value->TryGetNumber(N))
+			{
+				ByteProp->SetPropertyValue(ValuePtr, static_cast<uint8>(N));
+				return true;
+			}
+		}
+		else if (FObjectProperty* ObjProp = CastField<FObjectProperty>(Prop))
+		{
+			// Null / empty-string clears the reference (used to disconnect
+			// FExpressionInput.Expression pins via path assignment).
+			if (Value->Type == EJson::Null)
+			{
+				ObjProp->SetObjectPropertyValue(ValuePtr, nullptr);
+				return true;
+			}
+			FString S;
+			if (Value->TryGetString(S))
+			{
+				if (S.IsEmpty())
+				{
+					ObjProp->SetObjectPropertyValue(ValuePtr, nullptr);
+					return true;
+				}
+				UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(S);
+				if (LoadedAsset && LoadedAsset->IsA(ObjProp->PropertyClass))
+				{
+					ObjProp->SetObjectPropertyValue(ValuePtr, LoadedAsset);
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	// Walk a dotted/bracketed path like "Layers[0].BlendType" against a UStruct
+	// container, returning the leaf FProperty + raw value pointer on success.
+	// Supports descending into FStructProperty and indexing into FArrayProperty.
+	bool ResolvePropertyPath(UStruct* OuterStruct, void* OuterPtr, const FString& Path,
+		FProperty*& OutLeafProp, void*& OutLeafPtr, FString& OutError)
+	{
+		TArray<FString> Segments;
+		Path.ParseIntoArray(Segments, TEXT("."), true);
+		if (Segments.Num() == 0)
+		{
+			OutError = TEXT("Empty path");
+			return false;
+		}
+
+		UStruct* CurStruct = OuterStruct;
+		void* CurPtr = OuterPtr;
+		FProperty* CurProp = nullptr;
+
+		for (int32 i = 0; i < Segments.Num(); ++i)
+		{
+			const FString& Seg = Segments[i];
+			FString FieldName = Seg;
+			int32 Index = INDEX_NONE;
+			int32 BracketStart;
+			if (Seg.FindChar('[', BracketStart))
+			{
+				int32 BracketEnd;
+				if (!Seg.FindChar(']', BracketEnd) || BracketEnd <= BracketStart + 1)
+				{
+					OutError = FString::Printf(TEXT("Malformed array index in segment '%s'"), *Seg);
+					return false;
+				}
+				FString IndexStr = Seg.Mid(BracketStart + 1, BracketEnd - BracketStart - 1);
+				Index = FCString::Atoi(*IndexStr);
+				FieldName = Seg.Left(BracketStart);
+			}
+
+			if (!CurStruct)
+			{
+				OutError = FString::Printf(TEXT("Path '%s' descended past a non-struct value before '%s'"), *Path, *FieldName);
+				return false;
+			}
+
+			CurProp = CurStruct->FindPropertyByName(FName(*FieldName));
+			if (!CurProp)
+			{
+				OutError = FString::Printf(TEXT("Property not found: %s (in %s)"), *FieldName, *CurStruct->GetName());
+				return false;
+			}
+			CurPtr = CurProp->ContainerPtrToValuePtr<void>(CurPtr);
+
+			if (Index != INDEX_NONE)
+			{
+				FArrayProperty* ArrProp = CastField<FArrayProperty>(CurProp);
+				if (!ArrProp)
+				{
+					OutError = FString::Printf(TEXT("Property '%s' is not an array (segment '%s')"), *FieldName, *Seg);
+					return false;
+				}
+				FScriptArrayHelper ArrayHelper(ArrProp, CurPtr);
+				if (Index < 0 || Index >= ArrayHelper.Num())
+				{
+					OutError = FString::Printf(TEXT("Index %d out of bounds (size %d) for '%s'"), Index, ArrayHelper.Num(), *FieldName);
+					return false;
+				}
+				CurPtr = ArrayHelper.GetRawPtr(Index);
+				CurProp = ArrProp->Inner;
+			}
+
+			if (i + 1 < Segments.Num())
+			{
+				FStructProperty* StructProp = CastField<FStructProperty>(CurProp);
+				if (!StructProp)
+				{
+					OutError = FString::Printf(TEXT("Property '%s' is not a struct, cannot descend further"), *FieldName);
+					return false;
+				}
+				CurStruct = StructProp->Struct;
+			}
+		}
+
+		OutLeafProp = CurProp;
+		OutLeafPtr = CurPtr;
+		return true;
+	}
 }
 
 TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleSetMaterialNodeProperty(const TSharedPtr<FJsonObject>& Params)
@@ -2366,14 +2583,81 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleSetMaterialNodePropert
 		}
 	}
 
+	// Texture SamplerSource (FromAsset, Wrap, Clamp) — affects hardware sampler sharing
+	FString SamplerSourceStr;
+	if (Params->TryGetStringField(TEXT("sampler_source"), SamplerSourceStr))
+	{
+		if (UMaterialExpressionTextureSample* SampleExpr = Cast<UMaterialExpressionTextureSample>(Expression))
+		{
+			if (SamplerSourceStr.Equals(TEXT("FromAsset"), ESearchCase::IgnoreCase) ||
+				SamplerSourceStr.Equals(TEXT("FromTextureAsset"), ESearchCase::IgnoreCase))
+			{
+				SampleExpr->SamplerSource = SSM_FromTextureAsset;
+			}
+			else if (SamplerSourceStr.Equals(TEXT("Wrap"), ESearchCase::IgnoreCase) ||
+				SamplerSourceStr.Equals(TEXT("SharedWrap"), ESearchCase::IgnoreCase))
+			{
+				SampleExpr->SamplerSource = SSM_Wrap_WorldGroupSettings;
+			}
+			else if (SamplerSourceStr.Equals(TEXT("Clamp"), ESearchCase::IgnoreCase) ||
+				SamplerSourceStr.Equals(TEXT("SharedClamp"), ESearchCase::IgnoreCase))
+			{
+				SampleExpr->SamplerSource = SSM_Clamp_WorldGroupSettings;
+			}
+		}
+	}
+
 	// Generic UPROPERTY setter via reflection — set any property by name
 	const TSharedPtr<FJsonObject>* PropertiesObj = nullptr;
 	if (Params->TryGetObjectField(TEXT("properties"), PropertiesObj))
 	{
 		UClass* ExprClass = Expression->GetClass();
 		TArray<FString> SetProperties;
+
+		// Handle MaterialFunctionCall.MaterialFunction specially — must call
+		// SetMaterialFunction so UpdateFromFunctionResource regenerates pins.
+		// Direct UPROPERTY assignment via reflection on TObjectPtr would skip
+		// pin regeneration, leaving the call node stuck without inputs/outputs.
+		if (UMaterialExpressionMaterialFunctionCall* FuncCall = Cast<UMaterialExpressionMaterialFunctionCall>(Expression))
+		{
+			FString FuncPath;
+			if ((*PropertiesObj)->TryGetStringField(TEXT("MaterialFunction"), FuncPath))
+			{
+				FString LoadedFuncPath;
+				UMaterialFunction* TargetFunc = LoadMaterialFunction(FuncPath, LoadedFuncPath);
+				if (TargetFunc)
+				{
+					FuncCall->SetMaterialFunction(TargetFunc);
+					SetProperties.Add(TEXT("MaterialFunction"));
+				}
+			}
+		}
+
 		for (const auto& Pair : (*PropertiesObj)->Values)
 		{
+			// Skip MaterialFunction here — already handled above with proper pin refresh.
+			if (Pair.Key == TEXT("MaterialFunction") &&
+				Cast<UMaterialExpressionMaterialFunctionCall>(Expression))
+			{
+				continue;
+			}
+
+			// Path-style keys ("Layers[0].BlendType") drill into TArray/struct
+			// members via reflection. Plain keys still go through the legacy
+			// direct lookup below.
+			if (Pair.Key.Contains(TEXT(".")) || Pair.Key.Contains(TEXT("[")))
+			{
+				FProperty* LeafProp = nullptr;
+				void* LeafPtr = nullptr;
+				FString PathErr;
+				if (ResolvePropertyPath(ExprClass, Expression, Pair.Key, LeafProp, LeafPtr, PathErr)
+					&& ApplyJsonValueToLeafProperty(LeafProp, LeafPtr, Pair.Value))
+				{
+					SetProperties.Add(Pair.Key);
+				}
+				continue;
+			}
+
 			FProperty* Prop = ExprClass->FindPropertyByName(FName(*Pair.Key));
 			if (!Prop)
 			{
@@ -2473,7 +2757,39 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleSetMaterialNodePropert
 					SetProperties.Add(Pair.Key);
 				}
 			}
+			else if (FObjectProperty* ObjProp = CastField<FObjectProperty>(Prop))
+			{
+				// Bind any UObject reference (e.g. CollectionParameter.Collection,
+				// TextureSample.Texture) by asset path. Loads the asset and stores
+				// the pointer if its class is compatible with the property class.
+				FString AssetPath;
+				if (Pair.Value->TryGetString(AssetPath))
+				{
+					UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+					if (LoadedAsset && LoadedAsset->IsA(ObjProp->PropertyClass))
+					{
+						ObjProp->SetObjectPropertyValue(ValuePtr, LoadedAsset);
+						SetProperties.Add(Pair.Key);
+					}
+				}
+			}
 		}
+
+		// CollectionParameter — resolve ParameterId from Collection + ParameterName.
+		// Without this the node displays "None" / errors even with both fields set,
+		// because the runtime looks parameters up by GUID, not by name.
+		if (UMaterialExpressionCollectionParameter* CP = Cast<UMaterialExpressionCollectionParameter>(Expression))
+		{
+			if (CP->Collection && !CP->ParameterName.IsNone())
+			{
+				FGuid Found = CP->Collection->GetParameterId(CP->ParameterName);
+				if (Found.IsValid())
+				{
+					CP->ParameterId = Found;
+				}
+			}
+		}
+
 		if (SetProperties.Num() > 0)
 		{
 			TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
@@ -2695,6 +3011,59 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleConnectToMaterialOutpu
 		return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("From node not found: %s"), *FromNode));
 	}
 
+	// Special case: when UseMaterialAttributes is enabled, the UMaterial exposes
+	// a single FMaterialAttributesInput pin instead of the per-channel pins.
+	// EMaterialProperty has no MP_MaterialAttributes value, so StringToMaterialProperty
+	// falls through to MP_BaseColor which silently misroutes the connection.
+	// Detect this case and wire directly to UMaterialEditorOnlyData::MaterialAttributes.
+	if (MaterialProperty.Equals(TEXT("MaterialAttributes"), ESearchCase::IgnoreCase))
+	{
+		UMaterialEditorOnlyData* EdOnly = Material->GetEditorOnlyData();
+		if (!EdOnly)
+		{
+			return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Material has no editor-only data"));
+		}
+
+		// Also clear any previous per-channel wiring that may have been made when
+		// MaterialAttributes was off (otherwise stale BaseColor/Roughness/etc connections
+		// stay and the editor warns about them).
+		EdOnly->BaseColor.Expression = nullptr;
+		EdOnly->Metallic.Expression = nullptr;
+		EdOnly->Specular.Expression = nullptr;
+		EdOnly->Roughness.Expression = nullptr;
+		EdOnly->Normal.Expression = nullptr;
+		EdOnly->EmissiveColor.Expression = nullptr;
+		EdOnly->Opacity.Expression = nullptr;
+		EdOnly->OpacityMask.Expression = nullptr;
+		EdOnly->AmbientOcclusion.Expression = nullptr;
+
+		// Resolve output index from the FromOutput name. For MaterialFunctionCall and
+		// other multi-output nodes, the name must match one of the outputs; default 0.
+		int32 OutputIndex = 0;
+		if (!FromOutput.IsEmpty())
+		{
+			const TArray<FExpressionOutput>& Outs = FromExpression->GetOutputs();
+			for (int32 i = 0; i < Outs.Num(); ++i)
+			{
+				if (Outs[i].OutputName.ToString().Equals(FromOutput, ESearchCase::IgnoreCase))
+				{
+					OutputIndex = i;
+					break;
+				}
+			}
+		}
+
+		EdOnly->MaterialAttributes.Expression = FromExpression;
+		EdOnly->MaterialAttributes.OutputIndex = OutputIndex;
+		EdOnly->MaterialAttributes.Mask = 0;
+
+		Material->MarkPackageDirty();
+
+		TSharedPtr<FJsonObject> OkObj = MakeShared<FJsonObject>();
+		OkObj->SetBoolField(TEXT("success"), true);
+		return OkObj;
+	}
+
 	EMaterialProperty Property = StringToMaterialProperty(MaterialProperty);
 
 	bool bSuccess = UMaterialEditingLibrary::ConnectMaterialProperty(
@@ -2809,6 +3178,289 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleRecompileMaterial(cons
 
 	TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
 	ResultObj->SetBoolField(TEXT("success"), true);
+	return ResultObj;
+#else
+	return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Material editing requires editor"));
+#endif
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleCompileMaterialDetailed(const TSharedPtr<FJsonObject>& Params)
+{
+#if WITH_EDITOR
+	FString MaterialName;
+	if (!Params->TryGetStringField(TEXT("material_name"), MaterialName))
+	{
+		return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing required parameter: material_name"));
+	}
+
+	// Try loading as Material first, then as MaterialFunction
+	FString AssetPath;
+	UMaterial* Material = LoadMaterial(MaterialName, AssetPath);
+	UMaterialFunction* Function = nullptr;
+	if (!Material)
+	{
+		Function = LoadMaterialFunction(MaterialName, AssetPath);
+		if (!Function)
+		{
+			return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Material or function not found: %s"), *MaterialName));
+		}
+	}
+
+	// Recompile if it's a material
+	if (Material)
+	{
+		UMaterialEditingLibrary::RecompileMaterial(Material);
+	}
+
+	TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> ErrorsArr;
+	TArray<TSharedPtr<FJsonValue>> WarningsArr;
+	TArray<TSharedPtr<FJsonValue>> UnconnectedArr;
+	TArray<TSharedPtr<FJsonValue>> OrphanedArr;
+	ResultObj->SetStringField(TEXT("asset_type"), Material ? TEXT("Material") : TEXT("MaterialFunction"));
+
+	// 1) Gather shader compile errors from material resources (materials only)
+	if (Material)
+	{
+		for (int32 QualityLevel = 0; QualityLevel < EMaterialQualityLevel::Num; ++QualityLevel)
+		{
+			for (int32 FeatureLevel = 0; FeatureLevel < ERHIFeatureLevel::Num; ++FeatureLevel)
+			{
+				// UE 5.7 takes EShaderPlatform, not ERHIFeatureLevel — translate via the
+				// global table so we still iterate per feature level conceptually.
+				const ERHIFeatureLevel::Type FL = static_cast<ERHIFeatureLevel::Type>(FeatureLevel);
+				const EShaderPlatform Platform = GShaderPlatformForFeatureLevel[FL];
+				if (Platform == SP_NumPlatforms) { continue; }
+				const FMaterialResource* Resource = Material->GetMaterialResource(
+					Platform,
+					static_cast<EMaterialQualityLevel::Type>(QualityLevel));
+				if (Resource)
+				{
+					TArray<FString> ResErrors;
+					ResErrors = Resource->GetCompileErrors();
+					for (const FString& Err : ResErrors)
+					{
+						TSharedPtr<FJsonObject> ErrObj = MakeShared<FJsonObject>();
+						ErrObj->SetStringField(TEXT("error"), Err);
+						ErrObj->SetStringField(TEXT("feature_level"),
+							FeatureLevel == 0 ? TEXT("ES3_1") :
+							FeatureLevel == 1 ? TEXT("SM5") :
+							FeatureLevel == 2 ? TEXT("SM6") : TEXT("Unknown"));
+						ErrorsArr.Add(MakeShared<FJsonValueObject>(ErrObj));
+					}
+				}
+			}
+		}
+	}
+
+	// 2) Check each expression for unconnected inputs and errors
+	UMaterialEditorOnlyData* EdOnly = Material ? Material->GetEditorOnlyData() : nullptr;
+
+	// GetExpressions() returns TArrayView — copy to TArray for iteration
+	TArray<UMaterialExpression*> AllExpressions;
+	if (Material)
+	{
+		for (UMaterialExpression* Expr : Material->GetExpressions())
+		{
+			AllExpressions.Add(Expr);
+		}
+	}
+	else if (Function)
+	{
+		for (UMaterialExpression* Expr : Function->GetExpressions())
+		{
+			AllExpressions.Add(Expr);
+		}
+	}
+	TSet<UMaterialExpression*> ConnectedExpressions;
+
+	for (UMaterialExpression* Expr : AllExpressions)
+	{
+		if (!Expr) continue;
+
+		FString NodeName = Expr->Desc.IsEmpty() ? Expr->GetName() : Expr->Desc;
+
+		// Check Custom HLSL nodes for code issues
+		if (UMaterialExpressionCustom* CustomExpr = Cast<UMaterialExpressionCustom>(Expr))
+		{
+			if (CustomExpr->Code.IsEmpty())
+			{
+				TSharedPtr<FJsonObject> ErrObj = MakeShared<FJsonObject>();
+				ErrObj->SetStringField(TEXT("node"), NodeName);
+				ErrObj->SetStringField(TEXT("error"), TEXT("Custom HLSL node has empty code"));
+				ErrorsArr.Add(MakeShared<FJsonValueObject>(ErrObj));
+			}
+		}
+
+		// Track which expressions are connected (as outputs to other nodes)
+		const TArrayView<FExpressionInput*> Inputs = Expr->GetInputsView();
+		for (FExpressionInput* Input : Inputs)
+		{
+			if (Input && Input->Expression)
+			{
+				ConnectedExpressions.Add(Input->Expression);
+			}
+		}
+
+		// Report unconnected inputs for key node types
+		bool bIsParameter = Expr->IsA<UMaterialExpressionParameter>() ||
+		                     Expr->IsA<UMaterialExpressionTextureSampleParameter>();
+		bool bIsConstant = Expr->IsA<UMaterialExpressionConstant>() ||
+		                    Expr->IsA<UMaterialExpressionConstant3Vector>() ||
+		                    Expr->IsA<UMaterialExpressionConstant4Vector>();
+		bool bIsWorldData = Expr->IsA<UMaterialExpressionWorldPosition>() ||
+		                     Expr->IsA<UMaterialExpressionPixelNormalWS>() ||
+		                     Expr->IsA<UMaterialExpressionVertexNormalWS>() ||
+		                     Expr->IsA<UMaterialExpressionCameraPositionWS>();
+		bool bIsFuncIO = Expr->IsA<UMaterialExpressionFunctionInput>() ||
+		                  Expr->IsA<UMaterialExpressionFunctionOutput>();
+
+		// Skip nodes that have no required inputs
+		if (bIsParameter || bIsConstant || bIsWorldData || bIsFuncIO)
+		{
+			continue;
+		}
+
+		for (int32 i = 0; i < Inputs.Num(); ++i)
+		{
+			FExpressionInput* Input = Inputs[i];
+			if (Input && !Input->Expression)
+			{
+				FString InputName = Expr->GetInputName(i).ToString();
+				if (InputName.IsEmpty()) InputName = FString::Printf(TEXT("Input_%d"), i);
+
+				TSharedPtr<FJsonObject> UnconnObj = MakeShared<FJsonObject>();
+				UnconnObj->SetStringField(TEXT("node"), NodeName);
+				UnconnObj->SetStringField(TEXT("node_type"), Expr->GetClass()->GetName());
+				UnconnObj->SetStringField(TEXT("unconnected_input"), InputName);
+				UnconnObj->SetNumberField(TEXT("input_index"), i);
+				UnconnectedArr.Add(MakeShared<FJsonValueObject>(UnconnObj));
+			}
+		}
+	}
+
+	// 3) Find orphaned nodes (no output connections, not wired to material/function output)
+	TSet<UMaterialExpression*> OutputConnected;
+
+	// For materials: check material output pins
+	if (EdOnly)
+	{
+		auto CheckOutput = [&](FExpressionInput& Input)
+		{
+			if (Input.Expression)
+			{
+				OutputConnected.Add(Input.Expression);
+			}
+		};
+		CheckOutput(EdOnly->BaseColor);
+		CheckOutput(EdOnly->Metallic);
+		CheckOutput(EdOnly->Specular);
+		CheckOutput(EdOnly->Roughness);
+		CheckOutput(EdOnly->Normal);
+		CheckOutput(EdOnly->EmissiveColor);
+		CheckOutput(EdOnly->Opacity);
+		CheckOutput(EdOnly->OpacityMask);
+		CheckOutput(EdOnly->AmbientOcclusion);
+		CheckOutput(EdOnly->WorldPositionOffset);
+		CheckOutput(EdOnly->SubsurfaceColor);
+	}
+
+	// For functions: FunctionOutput nodes are "terminal" — their inputs count as connected
+	for (UMaterialExpression* Expr : AllExpressions)
+	{
+		if (UMaterialExpressionFunctionOutput* FuncOut = Cast<UMaterialExpressionFunctionOutput>(Expr))
+		{
+			OutputConnected.Add(Expr); // The output node itself is a terminal
+			const TArrayView<FExpressionInput*> FuncOutInputs = FuncOut->GetInputsView();
+			for (FExpressionInput* Input : FuncOutInputs)
+			{
+				if (Input && Input->Expression)
+				{
+					OutputConnected.Add(Input->Expression);
+				}
+			}
+		}
+	}
+
+	for (UMaterialExpression* Expr : AllExpressions)
+	{
+		if (!Expr) continue;
+		if (ConnectedExpressions.Contains(Expr)) continue;
+		if (OutputConnected.Contains(Expr)) continue;
+		// FunctionInput nodes are source nodes, not orphaned
+		if (Expr->IsA<UMaterialExpressionFunctionInput>()) continue;
+
+		FString NodeName = Expr->Desc.IsEmpty() ? Expr->GetName() : Expr->Desc;
+		TSharedPtr<FJsonObject> OrphanObj = MakeShared<FJsonObject>();
+		OrphanObj->SetStringField(TEXT("node"), NodeName);
+		OrphanObj->SetStringField(TEXT("node_type"), Expr->GetClass()->GetName());
+		OrphanObj->SetStringField(TEXT("issue"), TEXT("Node output not connected to anything"));
+		OrphanedArr.Add(MakeShared<FJsonValueObject>(OrphanObj));
+	}
+
+	// 4) Check which outputs are wired
+	TArray<TSharedPtr<FJsonValue>> OutputStatusArr;
+
+	// Material outputs
+	if (EdOnly)
+	{
+		auto ReportOutput = [&](FExpressionInput& Input, const TCHAR* Name)
+		{
+			TSharedPtr<FJsonObject> OutObj = MakeShared<FJsonObject>();
+			OutObj->SetStringField(TEXT("output"), Name);
+			OutObj->SetBoolField(TEXT("connected"), Input.Expression != nullptr);
+			if (Input.Expression)
+			{
+				FString FromName = Input.Expression->Desc.IsEmpty() ? Input.Expression->GetName() : Input.Expression->Desc;
+				OutObj->SetStringField(TEXT("from_node"), FromName);
+			}
+			OutputStatusArr.Add(MakeShared<FJsonValueObject>(OutObj));
+		};
+		ReportOutput(EdOnly->BaseColor, TEXT("BaseColor"));
+		ReportOutput(EdOnly->Metallic, TEXT("Metallic"));
+		ReportOutput(EdOnly->Specular, TEXT("Specular"));
+		ReportOutput(EdOnly->Roughness, TEXT("Roughness"));
+		ReportOutput(EdOnly->Normal, TEXT("Normal"));
+		ReportOutput(EdOnly->EmissiveColor, TEXT("EmissiveColor"));
+		ReportOutput(EdOnly->Opacity, TEXT("Opacity"));
+		ReportOutput(EdOnly->OpacityMask, TEXT("OpacityMask"));
+		ReportOutput(EdOnly->AmbientOcclusion, TEXT("AmbientOcclusion"));
+	}
+
+	// Function outputs
+	if (Function)
+	{
+		for (UMaterialExpression* Expr : AllExpressions)
+		{
+			if (UMaterialExpressionFunctionOutput* FuncOut = Cast<UMaterialExpressionFunctionOutput>(Expr))
+			{
+				TSharedPtr<FJsonObject> OutObj = MakeShared<FJsonObject>();
+				OutObj->SetStringField(TEXT("output"), FuncOut->OutputName.ToString());
+				const TArrayView<FExpressionInput*> FuncOutInputs = FuncOut->GetInputsView();
+				bool bConnected = FuncOutInputs.Num() > 0 && FuncOutInputs[0] && FuncOutInputs[0]->Expression != nullptr;
+				OutObj->SetBoolField(TEXT("connected"), bConnected);
+				if (bConnected)
+				{
+					FString FromName = FuncOutInputs[0]->Expression->Desc.IsEmpty() ? FuncOutInputs[0]->Expression->GetName() : FuncOutInputs[0]->Expression->Desc;
+					OutObj->SetStringField(TEXT("from_node"), FromName);
+				}
+				OutputStatusArr.Add(MakeShared<FJsonValueObject>(OutObj));
+			}
+		}
+	}
+
+	ResultObj->SetBoolField(TEXT("success"), true);
+	ResultObj->SetNumberField(TEXT("error_count"), ErrorsArr.Num());
+	ResultObj->SetNumberField(TEXT("warning_count"), WarningsArr.Num());
+	ResultObj->SetNumberField(TEXT("unconnected_input_count"), UnconnectedArr.Num());
+	ResultObj->SetNumberField(TEXT("orphaned_node_count"), OrphanedArr.Num());
+	ResultObj->SetArrayField(TEXT("errors"), ErrorsArr);
+	ResultObj->SetArrayField(TEXT("warnings"), WarningsArr);
+	ResultObj->SetArrayField(TEXT("unconnected_inputs"), UnconnectedArr);
+	ResultObj->SetArrayField(TEXT("orphaned_nodes"), OrphanedArr);
+	ResultObj->SetArrayField(TEXT("material_outputs"), OutputStatusArr);
+	ResultObj->SetNumberField(TEXT("total_nodes"), AllExpressions.Num());
+
 	return ResultObj;
 #else
 	return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Material editing requires editor"));
@@ -3520,10 +4172,11 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleGetMaterialInfo(const 
 		}
 
 		// ---- Input connections for this node ----
-		for (int32 i = 0; ; ++i)
+		const TArrayView<FExpressionInput*> Inputs = Expr->GetInputsView();
+		for (int32 i = 0; i < Inputs.Num(); ++i)
 		{
-			FExpressionInput* Input = Expr->GetInput(i);
-			if (!Input) { break; }
+			FExpressionInput* Input = Inputs[i];
+			if (!Input) { continue; }
 			if (Input->Expression)
 			{
 				TSharedPtr<FJsonObject> Conn = SerializeInputConnection(Input, Expr, i);
@@ -4474,6 +5127,32 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleAddFunctionNode(const 
 		}
 	}
 
+	// Handle MaterialFunctionCall — assign target function and regenerate pins.
+	// Required for nested MaterialFunctionCall nodes inside a MaterialFunction so
+	// connect_function_nodes can resolve named pins on the call.
+	if (UMaterialExpressionMaterialFunctionCall* FuncCall = Cast<UMaterialExpressionMaterialFunctionCall>(NewExpression))
+	{
+		FString FuncPath;
+		bool bHaveFuncPath = Params->TryGetStringField(TEXT("function_path"), FuncPath);
+		if (!bHaveFuncPath)
+		{
+			const TSharedPtr<FJsonObject>* PropsObj = nullptr;
+			if (Params->TryGetObjectField(TEXT("properties"), PropsObj))
+			{
+				bHaveFuncPath = (*PropsObj)->TryGetStringField(TEXT("MaterialFunction"), FuncPath);
+			}
+		}
+		if (bHaveFuncPath)
+		{
+			FString LoadedFuncPath;
+			UMaterialFunction* TargetFunc = LoadMaterialFunction(FuncPath, LoadedFuncPath);
+			if (TargetFunc)
+			{
+				FuncCall->SetMaterialFunction(TargetFunc);
+			}
+		}
+	}
+
 	Function->GetPackage()->MarkPackageDirty();
 
 	TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
@@ -4586,11 +5265,22 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleAddMaterialFunctionCal
 		return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing required parameter: function_path"));
 	}
 
-	FString MaterialPath;
-	UMaterial* Material = LoadMaterial(MaterialName, MaterialPath);
-	if (!Material)
+	// Auto-detect: try as UMaterial first, then as UMaterialFunction so callers can
+	// add MaterialFunctionCall nodes inside another material function.
+	UMaterial* Material = nullptr;
+	UMaterialFunction* HostFunction = nullptr;
 	{
-		return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Material not found: %s"), *MaterialName));
+		FString TryPath;
+		Material = LoadMaterial(MaterialName, TryPath);
+		if (!Material)
+		{
+			HostFunction = LoadMaterialFunction(MaterialName, TryPath);
+			if (!HostFunction)
+			{
+				return FUnrealMCPCommonUtils::CreateErrorResponse(
+					FString::Printf(TEXT("Material or MaterialFunction not found: %s"), *MaterialName));
+			}
+		}
 	}
 
 	FString LoadedFuncPath;
@@ -4610,8 +5300,8 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleAddMaterialFunctionCal
 
 	UMaterialExpressionMaterialFunctionCall* FuncCallExpr = Cast<UMaterialExpressionMaterialFunctionCall>(
 		UMaterialEditingLibrary::CreateMaterialExpressionEx(
-			Material,
-			nullptr,
+			Material,       // nullptr when host is a function
+			HostFunction,   // nullptr when host is a material
 			UMaterialExpressionMaterialFunctionCall::StaticClass(),
 			nullptr,
 			PosX, PosY,
@@ -4632,7 +5322,14 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleAddMaterialFunctionCal
 
 	FuncCallExpr->SetMaterialFunction(Function);
 
-	Material->MarkPackageDirty();
+	if (Material)
+	{
+		Material->MarkPackageDirty();
+	}
+	else if (HostFunction)
+	{
+		HostFunction->MarkPackageDirty();
+	}
 
 	// Build response with input/output pin info
 	TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
@@ -4775,6 +5472,8 @@ void FUnrealMCPMaterialCommands::RegisterCommands(FMCPCommandRegistry& Registry)
 		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("delete_material_node"), P); });
 	Registry.RegisterCommand(TEXT("recompile_material"),
 		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("recompile_material"), P); });
+	Registry.RegisterCommand(TEXT("compile_material_detailed"),
+		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("compile_material_detailed"), P); });
 	Registry.RegisterCommand(TEXT("create_material_instance"),
 		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("create_material_instance"), P); });
 	Registry.RegisterCommand(TEXT("set_material_instance_parameter"),

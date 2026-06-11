@@ -5,6 +5,8 @@
 #include "MCPCore.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "EditorAssetLibrary.h"
+#include "Editor.h"
+#include "Subsystems/AssetEditorSubsystem.h"
 #include "Misc/PackageName.h"
 #include "UObject/Package.h"
 #include "UObject/Class.h"
@@ -17,6 +19,9 @@
 #include "PCGSettings.h"
 #include "PCGPin.h"
 #include "PCGEdge.h"
+
+// Engine EdGraph for comment-box frames stored in UPCGGraph::ExtraEditorNodes
+#include "EdGraphNode_Comment.h"
 
 //=============================================================================
 // Internal helpers (file-local)
@@ -127,6 +132,12 @@ TSharedPtr<FJsonObject> FUnrealMCPPCGCommands::HandleCommand(
 	if (CommandType == TEXT("get_pcg_node_info")) { return HandleGetPCGNodeInfo(Params); }
 	if (CommandType == TEXT("list_pcg_node_pins")) { return HandleListPCGNodePins(Params); }
 
+	// Display / annotation
+	if (CommandType == TEXT("set_pcg_node_title")) { return HandleSetPCGNodeTitle(Params); }
+	if (CommandType == TEXT("set_pcg_node_comment")) { return HandleSetPCGNodeComment(Params); }
+	if (CommandType == TEXT("add_pcg_comment_box")) { return HandleAddPCGCommentBox(Params); }
+	if (CommandType == TEXT("frame_pcg_nodes")) { return HandleFramePCGNodes(Params); }
+
 	return CreateErrorResponse(FString::Printf(TEXT("Unknown PCG command: %s"), *CommandType));
 }
 
@@ -225,11 +236,36 @@ TSharedPtr<FJsonObject> FUnrealMCPPCGCommands::HandleDeletePCGGraph(const TShare
 	// Class-type guard: refuse to delete assets that aren't PCG graphs. Prevents
 	// a mis-typed path from destroying an unrelated asset (e.g. a blueprint).
 	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	if (!Cast<UPCGGraph>(LoadedAsset))
+	UPCGGraph* GraphToDelete = Cast<UPCGGraph>(LoadedAsset);
+	if (!GraphToDelete)
 	{
 		return CreateErrorResponse(
 			FString::Printf(TEXT("Asset at %s is not a UPCGGraph"), *AssetPath));
 	}
+
+	// Refuse to delete a graph that is the active edit target — the in-memory
+	// session would dangle on a destroyed UObject and the next mutation would
+	// crash the editor. Caller must end_pcg_edit first.
+	FMCPPCGContext& Context = FMCPPCGContext::Get();
+	if (Context.IsEditing() && Context.GetActiveGraph() == GraphToDelete)
+	{
+		return CreateErrorResponse(
+			FString::Printf(TEXT("Cannot delete %s while it is the active PCG edit session target; call end_pcg_edit first"),
+				*AssetPath));
+	}
+
+	// Close any asset editor for this graph before deletion. UPCGEditorGraph is
+	// transient and rebuilt on open, but leaving the editor window referencing
+	// a soon-to-be-destroyed UPCGGraph is a known crash trigger in 5.3.
+#if WITH_EDITOR
+	if (GEditor)
+	{
+		if (UAssetEditorSubsystem* AssetEditorSubsystem = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>())
+		{
+			AssetEditorSubsystem->CloseAllEditorsForAsset(GraphToDelete);
+		}
+	}
+#endif
 
 	if (!UEditorAssetLibrary::DeleteAsset(AssetPath))
 	{
@@ -2150,6 +2186,381 @@ TSharedPtr<FJsonObject> FUnrealMCPPCGCommands::HandleListPCGNodePins(const TShar
 }
 
 //=============================================================================
+// Display / Annotation Handlers
+//=============================================================================
+//
+// UPCGNode stores a display-title override (NodeTitle, FName) and a per-node
+// sticky-note string (NodeComment, FString). Both live on the node wrapper
+// rather than the settings object, so the generic set_pcg_node_property path
+// can't reach them — these handlers expose them directly.
+//
+// Comment-box frames (the colored rectangles users wrap nodes in for grouping)
+// are UEdGraphNode_Comment instances. PCG persists them via
+// UPCGGraph::ExtraEditorNodes — a TArray<UObject*> that PCGEditorGraph
+// duplicates into the editor graph on open. We append new comment nodes to
+// that array; when the user reopens the PCG asset the frames appear.
+
+TSharedPtr<FJsonObject> FUnrealMCPPCGCommands::HandleSetPCGNodeTitle(const TSharedPtr<FJsonObject>& Params)
+{
+	if (!Params.IsValid())
+	{
+		return CreateErrorResponse(TEXT("Missing parameters"));
+	}
+
+	FString GraphPath;
+	if (!Params->TryGetStringField(TEXT("graph_path"), GraphPath))
+	{
+		return CreateErrorResponse(TEXT("Missing 'graph_path' parameter"));
+	}
+
+	FString NodeId;
+	if (!Params->TryGetStringField(TEXT("node_id"), NodeId))
+	{
+		return CreateErrorResponse(TEXT("Missing 'node_id' parameter"));
+	}
+
+	// Empty title is allowed — resets the override so the node falls back to
+	// the settings-class display name.
+	FString Title;
+	Params->TryGetStringField(TEXT("title"), Title);
+
+	FMCPPCGContext& Context = FMCPPCGContext::Get();
+	if (!Context.IsEditingGraph(GraphPath))
+	{
+		return CreateErrorResponse(
+			FString::Printf(TEXT("No active PCG edit session for graph '%s' (call begin_pcg_edit first)"),
+							*GraphPath));
+	}
+
+	UPCGNode* Node = Context.FindNode(NodeId);
+	if (!Node)
+	{
+		return CreateErrorResponse(
+			FString::Printf(TEXT("Node id not found in session: %s"), *NodeId));
+	}
+
+	Node->Modify();
+	Node->NodeTitle = Title.IsEmpty() ? NAME_None : FName(*Title);
+
+	TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+	Data->SetStringField(TEXT("node_id"), NodeId);
+	Data->SetStringField(TEXT("title"), Title);
+	Data->SetBoolField(TEXT("applied"), true);
+	return CreateSuccessResponse(Data);
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPPCGCommands::HandleSetPCGNodeComment(const TSharedPtr<FJsonObject>& Params)
+{
+	if (!Params.IsValid())
+	{
+		return CreateErrorResponse(TEXT("Missing parameters"));
+	}
+
+	FString GraphPath;
+	if (!Params->TryGetStringField(TEXT("graph_path"), GraphPath))
+	{
+		return CreateErrorResponse(TEXT("Missing 'graph_path' parameter"));
+	}
+
+	FString NodeId;
+	if (!Params->TryGetStringField(TEXT("node_id"), NodeId))
+	{
+		return CreateErrorResponse(TEXT("Missing 'node_id' parameter"));
+	}
+
+	// Empty comment clears the sticky note and hides the bubble.
+	FString Comment;
+	Params->TryGetStringField(TEXT("comment"), Comment);
+
+	FMCPPCGContext& Context = FMCPPCGContext::Get();
+	if (!Context.IsEditingGraph(GraphPath))
+	{
+		return CreateErrorResponse(
+			FString::Printf(TEXT("No active PCG edit session for graph '%s' (call begin_pcg_edit first)"),
+							*GraphPath));
+	}
+
+	UPCGNode* Node = Context.FindNode(NodeId);
+	if (!Node)
+	{
+		return CreateErrorResponse(
+			FString::Printf(TEXT("Node id not found in session: %s"), *NodeId));
+	}
+
+#if WITH_EDITORONLY_DATA
+	Node->Modify();
+	Node->NodeComment = Comment;
+	const bool bHasText = !Comment.IsEmpty();
+	Node->bCommentBubbleVisible = bHasText ? 1 : 0;
+	Node->bCommentBubblePinned = bHasText ? 1 : 0;
+#endif
+
+	TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+	Data->SetStringField(TEXT("node_id"), NodeId);
+	Data->SetStringField(TEXT("comment"), Comment);
+	Data->SetBoolField(TEXT("applied"), true);
+	return CreateSuccessResponse(Data);
+}
+
+namespace
+{
+	/**
+	 * Append a UEdGraphNode_Comment to the PCG graph's ExtraEditorNodes array.
+	 * GetExtraEditorNodes() exposes a const ref; the setter takes const-ptr
+	 * elements, so we have to rebuild the array via copy + append.
+	 */
+	void AppendExtraEditorNode(UPCGGraph* Graph, UEdGraphNode* NewNode)
+	{
+		TArray<TObjectPtr<const UObject>> Updated;
+		Updated.Reserve(Graph->GetExtraEditorNodes().Num() + 1);
+		for (const TObjectPtr<UObject>& Existing : Graph->GetExtraEditorNodes())
+		{
+			Updated.Add(Existing.Get());
+		}
+		Updated.Add(NewNode);
+		Graph->SetExtraEditorNodes(Updated);
+	}
+
+	/** Parse an optional 3- or 4-element color array. Defaults to a neutral grey-yellow. */
+	FLinearColor ReadColor(const TSharedPtr<FJsonObject>& Params, const FLinearColor& Fallback)
+	{
+		const TArray<TSharedPtr<FJsonValue>>* ColorArray = nullptr;
+		if (Params->TryGetArrayField(TEXT("color"), ColorArray) && ColorArray && ColorArray->Num() >= 3)
+		{
+			const float R = static_cast<float>((*ColorArray)[0]->AsNumber());
+			const float G = static_cast<float>((*ColorArray)[1]->AsNumber());
+			const float B = static_cast<float>((*ColorArray)[2]->AsNumber());
+			const float A = ColorArray->Num() >= 4
+				? static_cast<float>((*ColorArray)[3]->AsNumber())
+				: 1.0f;
+			return FLinearColor(R, G, B, A);
+		}
+		return Fallback;
+	}
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPPCGCommands::HandleAddPCGCommentBox(const TSharedPtr<FJsonObject>& Params)
+{
+	if (!Params.IsValid())
+	{
+		return CreateErrorResponse(TEXT("Missing parameters"));
+	}
+
+	FString GraphPath;
+	if (!Params->TryGetStringField(TEXT("graph_path"), GraphPath))
+	{
+		return CreateErrorResponse(TEXT("Missing 'graph_path' parameter"));
+	}
+
+	FString Text;
+	Params->TryGetStringField(TEXT("text"), Text);
+
+	FMCPPCGContext& Context = FMCPPCGContext::Get();
+	if (!Context.IsEditingGraph(GraphPath))
+	{
+		return CreateErrorResponse(
+			FString::Printf(TEXT("No active PCG edit session for graph '%s' (call begin_pcg_edit first)"),
+							*GraphPath));
+	}
+
+	UPCGGraph* Graph = Context.GetActiveGraph();
+	if (!Graph)
+	{
+		return CreateErrorResponse(TEXT("Active PCG graph pointer is null"));
+	}
+
+	// Position: required at minimum so the comment isn't dropped at the origin
+	// on top of the input node. Size: optional, defaults match the engine's
+	// default comment placement.
+	int32 PosX = 0;
+	int32 PosY = 0;
+	const TArray<TSharedPtr<FJsonValue>>* PositionArray = nullptr;
+	if (Params->TryGetArrayField(TEXT("position"), PositionArray) && PositionArray && PositionArray->Num() >= 2)
+	{
+		PosX = static_cast<int32>((*PositionArray)[0]->AsNumber());
+		PosY = static_cast<int32>((*PositionArray)[1]->AsNumber());
+	}
+
+	int32 SizeX = 400;
+	int32 SizeY = 200;
+	const TArray<TSharedPtr<FJsonValue>>* SizeArray = nullptr;
+	if (Params->TryGetArrayField(TEXT("size"), SizeArray) && SizeArray && SizeArray->Num() >= 2)
+	{
+		SizeX = static_cast<int32>((*SizeArray)[0]->AsNumber());
+		SizeY = static_cast<int32>((*SizeArray)[1]->AsNumber());
+	}
+
+	const FLinearColor Color = ReadColor(Params, FLinearColor(1.0f, 0.85f, 0.3f, 0.4f));
+
+	UEdGraphNode_Comment* CommentNode = NewObject<UEdGraphNode_Comment>(Graph, NAME_None, RF_Transactional);
+	if (!CommentNode)
+	{
+		return CreateErrorResponse(TEXT("NewObject<UEdGraphNode_Comment> returned null"));
+	}
+	CommentNode->NodeComment = Text;
+	CommentNode->NodePosX = PosX;
+	CommentNode->NodePosY = PosY;
+	CommentNode->NodeWidth = SizeX;
+	CommentNode->NodeHeight = SizeY;
+	CommentNode->CommentColor = Color;
+	CommentNode->FontSize = 18;
+	CommentNode->bColorCommentBubble = true;
+	CommentNode->CreateNewGuid();
+
+	Graph->Modify();
+	AppendExtraEditorNode(Graph, CommentNode);
+
+	TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+	Data->SetStringField(TEXT("comment_guid"), CommentNode->NodeGuid.ToString());
+	Data->SetStringField(TEXT("text"), Text);
+	TArray<TSharedPtr<FJsonValue>> PosJson;
+	PosJson.Add(MakeShared<FJsonValueNumber>(PosX));
+	PosJson.Add(MakeShared<FJsonValueNumber>(PosY));
+	Data->SetArrayField(TEXT("position"), PosJson);
+	TArray<TSharedPtr<FJsonValue>> SizeJson;
+	SizeJson.Add(MakeShared<FJsonValueNumber>(SizeX));
+	SizeJson.Add(MakeShared<FJsonValueNumber>(SizeY));
+	Data->SetArrayField(TEXT("size"), SizeJson);
+	return CreateSuccessResponse(Data);
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPPCGCommands::HandleFramePCGNodes(const TSharedPtr<FJsonObject>& Params)
+{
+	if (!Params.IsValid())
+	{
+		return CreateErrorResponse(TEXT("Missing parameters"));
+	}
+
+	FString GraphPath;
+	if (!Params->TryGetStringField(TEXT("graph_path"), GraphPath))
+	{
+		return CreateErrorResponse(TEXT("Missing 'graph_path' parameter"));
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* NodeIdArray = nullptr;
+	if (!Params->TryGetArrayField(TEXT("node_ids"), NodeIdArray) || !NodeIdArray || NodeIdArray->Num() == 0)
+	{
+		return CreateErrorResponse(TEXT("Missing or empty 'node_ids' array"));
+	}
+
+	FString Text;
+	Params->TryGetStringField(TEXT("text"), Text);
+
+	// Padding sits between the bounding box of the framed nodes and the comment
+	// frame itself; default leaves a comfortable margin without crowding labels.
+	double Padding = 80.0;
+	Params->TryGetNumberField(TEXT("padding"), Padding);
+
+	FMCPPCGContext& Context = FMCPPCGContext::Get();
+	if (!Context.IsEditingGraph(GraphPath))
+	{
+		return CreateErrorResponse(
+			FString::Printf(TEXT("No active PCG edit session for graph '%s' (call begin_pcg_edit first)"),
+							*GraphPath));
+	}
+
+	UPCGGraph* Graph = Context.GetActiveGraph();
+	if (!Graph)
+	{
+		return CreateErrorResponse(TEXT("Active PCG graph pointer is null"));
+	}
+
+	// PCG nodes don't expose their rendered size; assume a nominal box so the
+	// frame encloses the rightmost/bottommost extent of each node rather than
+	// just its top-left anchor.
+	constexpr int32 NodeNominalW = 280;
+	constexpr int32 NodeNominalH = 120;
+
+	int32 MinX = MAX_int32;
+	int32 MinY = MAX_int32;
+	int32 MaxRight = MIN_int32;
+	int32 MaxBottom = MIN_int32;
+
+	TArray<FString> ResolvedIds;
+	TArray<FString> MissingIds;
+	for (const TSharedPtr<FJsonValue>& Value : *NodeIdArray)
+	{
+		const FString Id = Value->AsString();
+		UPCGNode* Node = Context.FindNode(Id);
+		if (!Node)
+		{
+			MissingIds.Add(Id);
+			continue;
+		}
+		int32 X = 0;
+		int32 Y = 0;
+		Node->GetNodePosition(X, Y);
+		MinX = FMath::Min(MinX, X);
+		MinY = FMath::Min(MinY, Y);
+		MaxRight = FMath::Max(MaxRight, X + NodeNominalW);
+		MaxBottom = FMath::Max(MaxBottom, Y + NodeNominalH);
+		ResolvedIds.Add(Id);
+	}
+
+	if (ResolvedIds.Num() == 0)
+	{
+		return CreateErrorResponse(TEXT("None of the supplied node_ids resolved in this session"));
+	}
+
+	const int32 Pad = FMath::Max(0, FMath::RoundToInt(static_cast<float>(Padding)));
+	// Extra vertical space at the top accommodates the comment title bar so it
+	// doesn't visually overlap the first row of framed nodes.
+	constexpr int32 TitleBarH = 40;
+	const int32 BoxX = MinX - Pad;
+	const int32 BoxY = MinY - Pad - TitleBarH;
+	const int32 BoxW = (MaxRight - MinX) + 2 * Pad;
+	const int32 BoxH = (MaxBottom - MinY) + 2 * Pad + TitleBarH;
+
+	const FLinearColor Color = ReadColor(Params, FLinearColor(0.25f, 0.55f, 1.0f, 0.4f));
+
+	UEdGraphNode_Comment* CommentNode = NewObject<UEdGraphNode_Comment>(Graph, NAME_None, RF_Transactional);
+	if (!CommentNode)
+	{
+		return CreateErrorResponse(TEXT("NewObject<UEdGraphNode_Comment> returned null"));
+	}
+	CommentNode->NodeComment = Text;
+	CommentNode->NodePosX = BoxX;
+	CommentNode->NodePosY = BoxY;
+	CommentNode->NodeWidth = BoxW;
+	CommentNode->NodeHeight = BoxH;
+	CommentNode->CommentColor = Color;
+	CommentNode->FontSize = 18;
+	CommentNode->bColorCommentBubble = true;
+	CommentNode->CreateNewGuid();
+
+	Graph->Modify();
+	AppendExtraEditorNode(Graph, CommentNode);
+
+	TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+	Data->SetStringField(TEXT("comment_guid"), CommentNode->NodeGuid.ToString());
+	Data->SetStringField(TEXT("text"), Text);
+	TArray<TSharedPtr<FJsonValue>> PosJson;
+	PosJson.Add(MakeShared<FJsonValueNumber>(BoxX));
+	PosJson.Add(MakeShared<FJsonValueNumber>(BoxY));
+	Data->SetArrayField(TEXT("position"), PosJson);
+	TArray<TSharedPtr<FJsonValue>> SizeJson;
+	SizeJson.Add(MakeShared<FJsonValueNumber>(BoxW));
+	SizeJson.Add(MakeShared<FJsonValueNumber>(BoxH));
+	Data->SetArrayField(TEXT("size"), SizeJson);
+	TArray<TSharedPtr<FJsonValue>> ResolvedJson;
+	for (const FString& Id : ResolvedIds)
+	{
+		ResolvedJson.Add(MakeShared<FJsonValueString>(Id));
+	}
+	Data->SetArrayField(TEXT("framed_node_ids"), ResolvedJson);
+	if (MissingIds.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> MissingJson;
+		for (const FString& Id : MissingIds)
+		{
+			MissingJson.Add(MakeShared<FJsonValueString>(Id));
+		}
+		Data->SetArrayField(TEXT("missing_node_ids"), MissingJson);
+	}
+	return CreateSuccessResponse(Data);
+}
+
+//=============================================================================
 // Command Registration
 //=============================================================================
 
@@ -2223,4 +2634,14 @@ void FUnrealMCPPCGCommands::RegisterCommands(FMCPCommandRegistry& Registry)
 		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("get_pcg_node_info"), P); });
 	Registry.RegisterCommand(TEXT("list_pcg_node_pins"),
 		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("list_pcg_node_pins"), P); });
+
+	// Display / annotation
+	Registry.RegisterCommand(TEXT("set_pcg_node_title"),
+		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("set_pcg_node_title"), P); });
+	Registry.RegisterCommand(TEXT("set_pcg_node_comment"),
+		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("set_pcg_node_comment"), P); });
+	Registry.RegisterCommand(TEXT("add_pcg_comment_box"),
+		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("add_pcg_comment_box"), P); });
+	Registry.RegisterCommand(TEXT("frame_pcg_nodes"),
+		[this](const TSharedPtr<FJsonObject>& P) { return HandleCommand(TEXT("frame_pcg_nodes"), P); });
 }

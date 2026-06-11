@@ -191,7 +191,14 @@ UBlueprint* FUnrealMCPCommonUtils::FindBlueprintByName(const FString& BlueprintN
         }
     }
 
-    // 4. Legacy fallback: try /Game/Blueprints/ path
+    // 4. Legacy fallback: try /Game/Blueprints/ path.
+    //    Only when caller passed a bare name — prepending to an absolute
+    //    path produces "/Game/Blueprints//Game/..." which fatals package
+    //    creation on the double slash.
+    if (BlueprintName.StartsWith(TEXT("/")))
+    {
+        return nullptr;
+    }
     FString LegacyPath = TEXT("/Game/Blueprints/") + BlueprintName;
     return LoadObject<UBlueprint>(nullptr, *LegacyPath);
 }

@@ -220,22 +220,208 @@ def register_editor_tools(mcp: FastMCP):
     def delete_actor(ctx: Context, name: str) -> Dict[str, Any]:
         """Delete an actor by name."""
         from unreal_mcp_server import get_unreal_connection
-        
+
         try:
             unreal = get_unreal_connection()
             if not unreal:
                 logger.error("Failed to connect to Unreal Engine")
                 return {"success": False, "message": "Failed to connect to Unreal Engine"}
-                
+
             response = unreal.send_command("delete_actor", {
                 "name": name
             })
             return response or {}
-            
+
         except Exception as e:
             logger.error(f"Error deleting actor: {e}")
             return {}
-    
+
+    @mcp.tool()
+    def list_static_mesh_actors(
+        ctx: Context,
+        persistent_only: bool = True,
+        folder_filter: str = "",
+    ) -> Dict[str, Any]:
+        """Enumerate StaticMeshActors in the current world with their mesh asset path and folder.
+
+        Useful for categorizing actors by what mesh they reference (e.g. moving every
+        SMA that uses /Game/.../SM_Couch_* into a "Props/Seating" folder).
+
+        Args:
+            persistent_only: Only return actors that live in the persistent level
+                (skip level-instance content). Default True.
+            folder_filter: If non-empty, only return actors whose current Folder Path
+                equals this value exactly (e.g. "Geometry/Static"). Default "" (no filter).
+
+        Returns:
+            {"count": int, "actors": [{"name", "folder_path", "mesh_path", "mesh_name", "location": [x,y,z]}, ...]}
+        """
+        from unreal_mcp_server import get_unreal_connection
+
+        try:
+            unreal = get_unreal_connection()
+            if not unreal:
+                return {"success": False, "message": "Failed to connect to Unreal Engine"}
+            params = {"persistent_only": persistent_only}
+            if folder_filter:
+                params["folder_filter"] = folder_filter
+            response = unreal.send_command("list_static_mesh_actors", params)
+            return response or {}
+        except Exception as e:
+            logger.error(f"Error in list_static_mesh_actors: {e}")
+            return {"success": False, "message": str(e)}
+
+    @mcp.tool()
+    def set_actor_folders(
+        ctx: Context,
+        actor_to_folder: Dict[str, str],
+        save: bool = True,
+    ) -> Dict[str, Any]:
+        """Set Outliner folder paths on persistent-level actors by name.
+
+        Args:
+            actor_to_folder: Dict mapping actor name (as shown in Outliner / GetName())
+                to target folder path. Folders can be nested with "/".
+            save: Save the persistent level afterwards. Default True.
+
+        Returns:
+            {"changed": int, "not_found": int, "missing_actor_names": [...], "saved": bool}
+        """
+        from unreal_mcp_server import get_unreal_connection
+
+        try:
+            unreal = get_unreal_connection()
+            if not unreal:
+                return {"success": False, "message": "Failed to connect to Unreal Engine"}
+            response = unreal.send_command("set_actor_folders", {
+                "actor_to_folder": actor_to_folder,
+                "save": save,
+            })
+            return response or {}
+        except Exception as e:
+            logger.error(f"Error in set_actor_folders: {e}")
+            return {"success": False, "message": str(e)}
+
+    @mcp.tool()
+    def organize_outliner_by_class(
+        ctx: Context,
+        class_to_folder: Dict[str, str],
+        only_if_empty: bool = True,
+        skip_level_instance_content: bool = True,
+        match_parent_classes: bool = True,
+        save: bool = True,
+    ) -> Dict[str, Any]:
+        """Bulk-assign Outliner folder paths to persistent-level actors by class.
+
+        Iterates every actor in the current persistent level, looks up its class name
+        in ``class_to_folder``, and sets the outliner Folder Path to the mapped value.
+        Optionally walks the class chain so subclasses inherit a folder mapping
+        (e.g. ``"Light"`` matches PointLight, SpotLight, etc.).
+
+        Args:
+            class_to_folder: Dict like {"StaticMeshActor": "Geometry",
+                "DecalActor": "Decals", "LevelInstance": "Houses", ...}.
+                Folder paths can be nested with ``/`` (e.g. ``"FX/Niagara"``).
+            only_if_empty: Only set folder on actors currently at the root
+                (folder path empty or "None"). Default True — preserves existing
+                organization.
+            skip_level_instance_content: Skip actors that live inside a loaded
+                level instance (i.e. not in the persistent level). Default True
+                to avoid touching sublevel-owned actors.
+            match_parent_classes: If exact class name isn't in the mapping,
+                walk up the class chain. Default True.
+            save: Save the persistent level after re-foldering. Default True.
+
+        Returns:
+            {
+              "total_changed": int,
+              "skipped_level_instance_content": int,
+              "skipped_already_in_folder": int,
+              "skipped_no_class_match": int,
+              "saved": bool,
+              "by_folder": {"FolderName": count, ...}
+            }
+        """
+        from unreal_mcp_server import get_unreal_connection
+
+        try:
+            unreal = get_unreal_connection()
+            if not unreal:
+                logger.error("Failed to connect to Unreal Engine")
+                return {"success": False, "message": "Failed to connect to Unreal Engine"}
+
+            params = {
+                "class_to_folder": class_to_folder,
+                "only_if_empty": only_if_empty,
+                "skip_level_instance_content": skip_level_instance_content,
+                "match_parent_classes": match_parent_classes,
+                "save": save,
+            }
+            response = unreal.send_command("organize_outliner_by_class", params)
+            return response or {}
+
+        except Exception as e:
+            logger.error(f"Error in organize_outliner_by_class: {e}")
+            return {"success": False, "message": str(e)}
+
+    @mcp.tool()
+    def fix_null_static_mesh_actors(
+        ctx: Context,
+        map_paths: List[str] = None,
+        include_persistent: bool = True,
+        save: bool = True,
+        restore_original: bool = True,
+    ) -> Dict[str, Any]:
+        """Sweep persistent + given sublevels and delete every StaticMeshActor with a NULL StaticMesh, saving each modified map.
+
+        Walks the current persistent level first (when include_persistent=True), then loads each
+        sublevel path in turn, scans for StaticMeshActor with no StaticMesh assigned, destroys them,
+        and saves the map. Finally restores the originally open map when restore_original=True.
+
+        Use this to clean Map Check warnings of the form
+        "StaticMeshActor_NNN Static mesh actor has NULL StaticMesh property" without manually
+        switching maps in the editor.
+
+        Args:
+            map_paths: Long package paths of sublevel maps to fix
+                (e.g. ["/Game/ModernMansions/Maps/Buildings/House01", ...]).
+                If None or empty, only the persistent level is processed (when include_persistent).
+            include_persistent: Also fix the currently loaded persistent level. Default True.
+            save: Save each map after deletion. Default True.
+            restore_original: After processing, reload the original persistent map. Default True.
+
+        Returns:
+            {
+              "total_deleted": int,
+              "original_map": "/Game/...",
+              "per_map": [
+                {"map_path": ..., "deleted_count": int, "saved": bool, "deleted_names": [...], "error": "..."}
+              ]
+            }
+        """
+        from unreal_mcp_server import get_unreal_connection
+
+        try:
+            unreal = get_unreal_connection()
+            if not unreal:
+                logger.error("Failed to connect to Unreal Engine")
+                return {"success": False, "message": "Failed to connect to Unreal Engine"}
+
+            params: Dict[str, Any] = {
+                "include_persistent": include_persistent,
+                "save": save,
+                "restore_original": restore_original,
+            }
+            if map_paths:
+                params["map_paths"] = map_paths
+
+            response = unreal.send_command("fix_null_static_mesh_actors", params)
+            return response or {}
+
+        except Exception as e:
+            logger.error(f"Error in fix_null_static_mesh_actors: {e}")
+            return {"success": False, "message": str(e)}
+
     @mcp.tool()
     def set_actor_transform(
         ctx: Context,

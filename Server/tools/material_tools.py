@@ -278,7 +278,9 @@ def register_material_tools(mcp: FastMCP):
         node_name: str,
         value: Optional[float] = None,
         color: Optional[List[float]] = None,
-        sampler_type: Optional[str] = None
+        sampler_type: Optional[str] = None,
+        sampler_source: Optional[str] = None,
+        properties: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Set properties on an existing material expression node.
@@ -289,6 +291,10 @@ def register_material_tools(mcp: FastMCP):
             value: Scalar value (for Constant/ScalarParameter)
             color: [R, G, B, A] color value (for vector nodes)
             sampler_type: Texture sampler type (Color, Normal, LinearColor, Masks, Grayscale, Alpha, Data)
+            sampler_source: Sampler source mode for TextureSample nodes.
+                FromAsset (default, 1 hardware sampler per texture),
+                Wrap (shared wrap sampler — all textures share 1 HW sampler),
+                Clamp (shared clamp sampler). Use "Wrap" to fit many textures in a single material.
 
         Returns:
             Dict with success status
@@ -311,6 +317,10 @@ def register_material_tools(mcp: FastMCP):
                 params["color"] = color
             if sampler_type is not None:
                 params["sampler_type"] = sampler_type
+            if sampler_source is not None:
+                params["sampler_source"] = sampler_source
+            if properties is not None:
+                params["properties"] = properties
 
             response = unreal.send_command("set_material_node_property", params)
 
@@ -487,6 +497,49 @@ def register_material_tools(mcp: FastMCP):
 
         except Exception as e:
             logger.error(f"Error recompiling material: {e}")
+            return {"status": "error", "error": str(e)}
+
+    @mcp.tool()
+    def compile_material_detailed(
+        ctx: Context,
+        material_name: str
+    ) -> Dict[str, Any]:
+        """
+        Recompile a material and return detailed diagnostics.
+
+        Recompiles, then reports: shader compile errors (with feature level),
+        unconnected input pins (node name, pin name, index), orphaned nodes
+        (outputs going nowhere), and material output wiring status.
+
+        Use this to find exactly what's broken without screenshots.
+
+        Args:
+            material_name: Target material name or path
+
+        Returns:
+            Dict with error_count, warning_count, unconnected_input_count,
+            orphaned_node_count, plus arrays: errors, warnings,
+            unconnected_inputs, orphaned_nodes, material_outputs.
+        """
+        from unreal_mcp_server import get_unreal_connection
+
+        try:
+            unreal = get_unreal_connection()
+            if not unreal:
+                logger.warning("Failed to connect to Unreal Engine")
+                return {"status": "error", "error": "Failed to connect to Unreal Engine"}
+
+            response = unreal.send_command("compile_material_detailed", {
+                "material_name": material_name
+            })
+
+            if not response:
+                return {"status": "error", "error": "No response from Unreal Engine"}
+
+            return {"status": "success", "result": response}
+
+        except Exception as e:
+            logger.error(f"Error in compile_material_detailed: {e}")
             return {"status": "error", "error": str(e)}
 
     @mcp.tool()
@@ -1051,8 +1104,14 @@ def register_material_tools(mcp: FastMCP):
                 logger.warning("Failed to connect to Unreal Engine")
                 return {"status": "error", "error": "Failed to connect to Unreal Engine"}
 
-            response = unreal.send_command("connect_function_nodes", {
-                "function_name": function_name,
+            # Forward to connect_material_nodes (C++ side auto-detects whether the
+            # asset is a UMaterial or UMaterialFunction). That handler applies
+            # reflection-based pin-name fallbacks that the legacy
+            # connect_function_nodes handler lacks — needed for nodes whose
+            # default FExpressionInput has an empty InputName (ComponentMask,
+            # Divide, TextureSample.Coordinates, etc.).
+            response = unreal.send_command("connect_material_nodes", {
+                "material_name": function_name,
                 "from_node": from_node,
                 "to_node": to_node,
                 "to_input": to_input,

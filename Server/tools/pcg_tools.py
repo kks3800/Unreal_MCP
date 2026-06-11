@@ -886,3 +886,176 @@ def register_pcg_tools(mcp: FastMCP):
         except Exception as e:
             logger.error(f"Error listing PCG node pins: {e}")
             return {"success": False, "message": str(e)}
+
+    # ========================================================================
+    # Display / Annotation
+    # ========================================================================
+
+    @mcp.tool()
+    def set_pcg_node_title(
+        ctx: Context,
+        graph_path: str,
+        node_id: str,
+        title: str
+    ) -> Dict[str, Any]:
+        """
+        Override the display title of a PCG node. The override lives on the
+        UPCGNode wrapper (FName NodeTitle) rather than on the settings object,
+        so set_pcg_node_property cannot reach it.
+
+        Pass an empty string to clear the override and fall back to the
+        settings-class default name. Requires an active edit session.
+
+        Args:
+            graph_path: Path of the graph being edited (must match active session)
+            node_id: Session-local node id
+            title: New display title (empty string clears the override)
+
+        Returns:
+            Response with node_id, title, applied flag
+        """
+        from unreal_mcp_server import get_unreal_connection
+        try:
+            unreal = get_unreal_connection()
+            if not unreal:
+                return {"success": False, "message": "Failed to connect to Unreal Engine"}
+            response = unreal.send_command("set_pcg_node_title", {
+                "graph_path": graph_path,
+                "node_id": node_id,
+                "title": title,
+            })
+            if not response:
+                return {"success": False, "message": "No response from Unreal Engine"}
+            return response
+        except Exception as e:
+            logger.error(f"Error setting PCG node title: {e}")
+            return {"success": False, "message": str(e)}
+
+    @mcp.tool()
+    def set_pcg_node_comment(
+        ctx: Context,
+        graph_path: str,
+        node_id: str,
+        comment: str
+    ) -> Dict[str, Any]:
+        """
+        Attach a per-node sticky-note comment to a PCG node. The bubble auto-
+        shows when text is non-empty and hides when cleared. Lives on the node
+        wrapper (NodeComment, FString) — distinct from comment-box frames.
+
+        Args:
+            graph_path: Path of the graph being edited (must match active session)
+            node_id: Session-local node id
+            comment: Sticky-note text (empty string clears it)
+
+        Returns:
+            Response with node_id, comment, applied flag
+        """
+        from unreal_mcp_server import get_unreal_connection
+        try:
+            unreal = get_unreal_connection()
+            if not unreal:
+                return {"success": False, "message": "Failed to connect to Unreal Engine"}
+            response = unreal.send_command("set_pcg_node_comment", {
+                "graph_path": graph_path,
+                "node_id": node_id,
+                "comment": comment,
+            })
+            if not response:
+                return {"success": False, "message": "No response from Unreal Engine"}
+            return response
+        except Exception as e:
+            logger.error(f"Error setting PCG node comment: {e}")
+            return {"success": False, "message": str(e)}
+
+    @mcp.tool()
+    def add_pcg_comment_box(
+        ctx: Context,
+        graph_path: str,
+        text: str = "",
+        position: Optional[List[float]] = None,
+        size: Optional[List[float]] = None,
+        color: Optional[List[float]] = None
+    ) -> Dict[str, Any]:
+        """
+        Add a free-standing comment-box frame to the PCG graph. Stored in
+        UPCGGraph::ExtraEditorNodes; appears next time the PCG asset is opened
+        in the editor. Use frame_pcg_nodes when you want the frame auto-sized
+        around a known set of node ids.
+
+        Args:
+            graph_path: Path of the graph being edited (must match active session)
+            text: Title text shown in the comment frame header
+            position: [X, Y] graph coordinates of the top-left corner (default [0, 0])
+            size: [Width, Height] of the box (default [400, 200])
+            color: [R, G, B, A] in 0..1 range (default soft yellow)
+
+        Returns:
+            Response with comment_guid, text, position, size
+        """
+        from unreal_mcp_server import get_unreal_connection
+        try:
+            unreal = get_unreal_connection()
+            if not unreal:
+                return {"success": False, "message": "Failed to connect to Unreal Engine"}
+            params: Dict[str, Any] = {"graph_path": graph_path, "text": text}
+            if position is not None:
+                params["position"] = position
+            if size is not None:
+                params["size"] = size
+            if color is not None:
+                params["color"] = color
+            response = unreal.send_command("add_pcg_comment_box", params)
+            if not response:
+                return {"success": False, "message": "No response from Unreal Engine"}
+            return response
+        except Exception as e:
+            logger.error(f"Error adding PCG comment box: {e}")
+            return {"success": False, "message": str(e)}
+
+    @mcp.tool()
+    def frame_pcg_nodes(
+        ctx: Context,
+        graph_path: str,
+        node_ids: List[str],
+        text: str = "",
+        padding: float = 80.0,
+        color: Optional[List[float]] = None
+    ) -> Dict[str, Any]:
+        """
+        Wrap a set of PCG nodes in an auto-sized comment-box frame. Computes
+        the bounding box from each node's position (with a nominal node size
+        assumption since PCG nodes don't expose rendered dimensions), then
+        adds padding plus a title-bar allowance at the top.
+
+        Args:
+            graph_path: Path of the graph being edited (must match active session)
+            node_ids: Session-local node ids to enclose
+            text: Title text shown in the comment frame header
+            padding: Margin in graph units between framed nodes and frame edge (default 80)
+            color: [R, G, B, A] in 0..1 range (default soft blue)
+
+        Returns:
+            Response with comment_guid, text, position, size, framed_node_ids,
+            and missing_node_ids (ids that couldn't be resolved in the session)
+        """
+        from unreal_mcp_server import get_unreal_connection
+        try:
+            unreal = get_unreal_connection()
+            if not unreal:
+                return {"success": False, "message": "Failed to connect to Unreal Engine"}
+            params: Dict[str, Any] = {
+                "graph_path": graph_path,
+                "node_ids": node_ids,
+                "text": text,
+                "padding": padding,
+            }
+            if color is not None:
+                params["color"] = color
+            response = unreal.send_command("frame_pcg_nodes", params)
+            if not response:
+                return {"success": False, "message": "No response from Unreal Engine"}
+            return response
+        except Exception as e:
+            logger.error(f"Error framing PCG nodes: {e}")
+            return {"success": False, "message": str(e)}

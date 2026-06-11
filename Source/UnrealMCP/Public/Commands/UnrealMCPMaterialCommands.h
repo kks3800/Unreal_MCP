@@ -69,6 +69,9 @@ public:
 	/** Recompile a material after making changes. */
 	static TSharedPtr<FJsonObject> HandleRecompileMaterial(const TSharedPtr<FJsonObject>& Params);
 
+	/** Recompile a material and return detailed diagnostics: compile errors, unconnected pins, orphaned nodes. */
+	static TSharedPtr<FJsonObject> HandleCompileMaterialDetailed(const TSharedPtr<FJsonObject>& Params);
+
 	/** Create a Material Instance Constant from a parent material. */
 	static TSharedPtr<FJsonObject> HandleCreateMaterialInstance(const TSharedPtr<FJsonObject>& Params);
 

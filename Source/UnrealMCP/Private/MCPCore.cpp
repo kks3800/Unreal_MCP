@@ -305,11 +305,28 @@ bool FMCPPCGContext::BeginEdit(const FString& GraphPath)
 	NodeToId.Reset();
 	NodeTypeCounters.Reset();
 
+	// Register every pre-existing node under its FName so callers can address
+	// on-disk nodes via the same id reported by get_pcg_graph_snapshot's
+	// fallback path (Node->GetFName().ToString()). Without this, only nodes
+	// added via add_pcg_node in this session would be addressable by mutation
+	// commands (delete/move/set_property/connect/disconnect).
+	for (UPCGNode* Node : Graph->GetNodes())
+	{
+		if (!Node)
+		{
+			continue;
+		}
+		const FString FNameId = Node->GetFName().ToString();
+		IdToNode.Add(FNameId, Node);
+		NodeToId.Add(Node, FNameId);
+	}
+
 #if WITH_EDITOR
 	Graph->DisableNotificationsForEditor();
 #endif
 
-	UE_LOG(LogTemp, Log, TEXT("MCPPCGContext: Begin editing %s"), *ActiveGraphPath);
+	UE_LOG(LogTemp, Log, TEXT("MCPPCGContext: Begin editing %s (%d existing nodes registered)"),
+		*ActiveGraphPath, IdToNode.Num());
 	return true;
 }
 
@@ -468,8 +485,19 @@ FString FMCPPCGContext::GenerateNodeId(const FString& TypeShortName)
 	// Counter is post-incremented so the first SurfaceSampler in a session gets
 	// SurfaceSampler_0, matching zero-based indexing the clients expect.
 	int32& Counter = NodeTypeCounters.FindOrAdd(TypeShortName);
-	const FString Id = FString::Printf(TEXT("%s_%d"), *TypeShortName, Counter);
-	++Counter;
+	// Skip ids that already exist in the session — pre-existing on-disk nodes
+	// are registered under their FName at BeginEdit, and an FName like
+	// "SurfaceSampler_0" would otherwise collide on the next add of the same
+	// type. The duplicate-id guard in HandleAddPCGNode would reject the call;
+	// stepping past the collision keeps add_pcg_node working on graphs that
+	// already contain nodes of the same type.
+	FString Id;
+	do
+	{
+		Id = FString::Printf(TEXT("%s_%d"), *TypeShortName, Counter);
+		++Counter;
+	}
+	while (IdToNode.Contains(Id));
 	return Id;
 }
 

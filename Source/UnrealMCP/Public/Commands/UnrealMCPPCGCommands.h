@@ -79,6 +79,12 @@ public:
 	TSharedPtr<FJsonObject> HandleGetPCGNodeInfo(const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleListPCGNodePins(const TSharedPtr<FJsonObject>& Params);
 
+	// Display / annotation — node titles, sticky-note comments, and comment-box frames
+	TSharedPtr<FJsonObject> HandleSetPCGNodeTitle(const TSharedPtr<FJsonObject>& Params);
+	TSharedPtr<FJsonObject> HandleSetPCGNodeComment(const TSharedPtr<FJsonObject>& Params);
+	TSharedPtr<FJsonObject> HandleAddPCGCommentBox(const TSharedPtr<FJsonObject>& Params);
+	TSharedPtr<FJsonObject> HandleFramePCGNodes(const TSharedPtr<FJsonObject>& Params);
+
 private:
 	//-------------------------------------------------------------------------
 	// Response Helpers

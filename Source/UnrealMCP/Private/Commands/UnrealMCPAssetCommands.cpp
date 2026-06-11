@@ -10,7 +10,10 @@
 #include "IAssetTools.h"
 #include "AssetToolsModule.h"
 #include "UObject/ObjectRedirector.h"
+#include "UObject/SavePackage.h"
 #include "Misc/PackageName.h"
+#include "Engine/Blueprint.h"
+#include "Kismet2/KismetEditorUtilities.h"
 
 FUnrealMCPAssetCommands::FUnrealMCPAssetCommands()
 {
@@ -758,7 +761,39 @@ TSharedPtr<FJsonObject> FUnrealMCPAssetCommands::HandleSaveAsset(
 			FString::Printf(TEXT("Asset not found: %s"), *AssetPath));
 	}
 
-	bool bSuccess = UEditorAssetLibrary::SaveAsset(AssetPath, bOnlyIfDirty);
+	// UEditorAssetLibrary::SaveAsset null-derefs on freshly-modified blueprints
+	// (e.g. after Mobility/component property changes via the property editor
+	// path). Load → compile-if-BP → save package directly to avoid that.
+	UObject* Asset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	if (!Asset)
+	{
+		return FUnrealMCPCommonUtils::CreateErrorResponse(
+			FString::Printf(TEXT("Failed to load asset: %s"), *AssetPath));
+	}
+
+	// Do NOT call CompileBlueprint here — set_component_property can leave a BP
+	// in a state where recompile null-derefs. Caller should explicitly call
+	// compile_blueprint before save if a recompile is required.
+
+	UPackage* Package = Asset->GetOutermost();
+	bool bSuccess = false;
+	if (Package)
+	{
+		if (!bOnlyIfDirty || Package->IsDirty())
+		{
+			const FString PackageFileName = FPackageName::LongPackageNameToFilename(
+				Package->GetName(), FPackageName::GetAssetPackageExtension());
+			FSavePackageArgs SaveArgs;
+			SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+			SaveArgs.SaveFlags = SAVE_NoError;
+			SaveArgs.Error = GError;
+			bSuccess = UPackage::SavePackage(Package, Asset, *PackageFileName, SaveArgs);
+		}
+		else
+		{
+			bSuccess = true;
+		}
+	}
 
 	TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject);
 	Result->SetBoolField(TEXT("success"), bSuccess);

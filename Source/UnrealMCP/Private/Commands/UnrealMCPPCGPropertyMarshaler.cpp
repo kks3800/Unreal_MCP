@@ -1455,17 +1455,37 @@ bool FPCGPropertyPathResolver::Resolve(
 			return true;
 		}
 
-		FStructProperty* StructProp = CastField<FStructProperty>(FieldProp);
-		if (!StructProp)
+		if (FStructProperty* StructProp = CastField<FStructProperty>(FieldProp))
 		{
-			OutError = FString::Printf(
-				TEXT("Property path failed at '%s' - intermediate field is %s, expected struct to descend into"),
-				*Step.FieldName, *FieldProp->GetClass()->GetName());
-			return false;
+			CurContainer = StructProp->ContainerPtrToValuePtr<void>(CurContainer);
+			CurStruct = StructProp->Struct;
+			continue;
 		}
 
-		CurContainer = StructProp->ContainerPtrToValuePtr<void>(CurContainer);
-		CurStruct = StructProp->Struct;
+		// Instanced subobjects (e.g. UPCGStaticMeshSpawnerSettings::MeshSelectorParameters
+		// pointing at a UPCGMeshSelectorWeighted instance). Chase the live pointer
+		// and use the runtime class — this is what makes paths like
+		// "MeshSelectorParameters.MeshEntries" work even though the intermediate
+		// field is an ObjectProperty rather than a struct.
+		if (FObjectProperty* ObjProp = CastField<FObjectProperty>(FieldProp))
+		{
+			UObject* Inner = ObjProp->GetObjectPropertyValue_InContainer(CurContainer);
+			if (!Inner)
+			{
+				OutError = FString::Printf(
+					TEXT("Property path failed at '%s' - intermediate object reference is null; assign the subobject before descending"),
+					*Step.FieldName);
+				return false;
+			}
+			CurContainer = Inner;
+			CurStruct = Inner->GetClass();
+			continue;
+		}
+
+		OutError = FString::Printf(
+			TEXT("Property path failed at '%s' - intermediate field is %s, expected struct or object reference to descend into"),
+			*Step.FieldName, *FieldProp->GetClass()->GetName());
+		return false;
 	}
 
 	// Should be unreachable because every branch above returns on the last step.

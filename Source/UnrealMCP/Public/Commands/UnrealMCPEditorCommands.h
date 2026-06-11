@@ -45,4 +45,10 @@ private:
     TSharedPtr<FJsonObject> HandleTakeEditorScreenshot(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleGetCVar(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleSetCVar(const TSharedPtr<FJsonObject>& Params);
+
+    // Bulk Outliner / cleanup commands
+    TSharedPtr<FJsonObject> HandleFixNullStaticMeshActors(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleOrganizeOutlinerByClass(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleListStaticMeshActors(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleSetActorFolders(const TSharedPtr<FJsonObject>& Params);
 };
